@@ -42,14 +42,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path, help="new directory for samples and local logs")
     parser.add_argument("--rounds", type=int, default=5)
+
+    parser.add_argument("--icd", type=Path, help="explicit candidate ICD; release plugins require a root-owned file/directory")
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be positive")
     args.output.mkdir(parents=True, exist_ok=False)
     environment = dict(os.environ)
     for key in list(environment):
-        if key.startswith(("DYLD_", "GPU_PROBE_")):
+        if key.startswith(("DYLD_", "GPU_PROBE_")) or key in ("NM_TEST_PLUGIN", "NM_TEST_ICD"):
             environment.pop(key)
+
+    if args.icd:
+        environment["NM_TEST_ICD"] = str(args.icd.resolve(strict=True))
     runs = []
     image_hash = None
     initial_windowserver = windowserver()
@@ -60,7 +65,7 @@ def main():
             "xcrun", "clang", "-O2", "-fobjc-arc",
             str(Path(__file__).with_suffix(".m")),
             "-framework", "Foundation", "-framework", "Metal",
-            "-framework", "CoreGraphics", "-framework", "CoreImage", "-o", binary,
+            "-framework", "CoreGraphics", "-framework", "CoreImage", "-framework", "IOKit", "-o", binary,
         ], check=True, env=environment)
 
         def probe(label, mode, policy=None):
@@ -80,7 +85,10 @@ def main():
                 raise RuntimeError("probe failed or WindowServer restarted; inspect " + label)
             data = json.loads(proc.stdout)
             if mode in ("compute", "image"):
-                enabled = "event wait ON" in proc.stderr
+                stats = data.get("wait_stats")
+                # Release builds intentionally suppress the old event-wait diagnostic.
+                # Require actual kernel-wait calls when telemetry exists; do not infer success from a setting alone.
+                enabled = stats["event_calls"] > 0 if stats is not None else "event wait ON" in proc.stderr
                 if enabled != (policy == "event") or "event wait OFF" in proc.stderr:
                     raise RuntimeError("requested wait policy was not verified: " + label)
             if mode in ("compute", "events") and data.get("verified") is not True:

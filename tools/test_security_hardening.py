@@ -212,9 +212,15 @@ check('the two lookups take no mutex (they run in the interrupt path) and read t
 # only as a fallback for a translator that cannot answer.
 _vl = lib.split('BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)\n{')[1].split('\n}\n')[0] \
       if 'BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)\n{' in lib else ''
+# The translator's answer is remembered per AIR text (nvmtl_vlink_cached); the fallback text is never cached.
+_vc = lib.split('static int nvmtl_vlink_cached(NSString *air)\n{')[1].split('\n}\n')[0] \
+      if 'static int nvmtl_vlink_cached(NSString *air)\n{' in lib else ''
 check('deferring a function to pipeline creation asks the translator for its visible references first',
-      bool(_vl) and _vl.index('xlate_vrefs(') < _vl.index('rangeOfString:')
-      and 'no linked function supplies it' in _vl)
+      bool(_vl) and bool(_vc) and 'xlate_vrefs(' in _vc and 'rangeOfString:' not in _vc
+      and _vl.index('nvmtl_vlink_cached(') < _vl.index('rangeOfString:')
+      and 'no linked function supplies it' in _vl
+      and _vc.index('xlate_vrefs(') < _vc.index('setObject:')
+      and 'return -1' in _vc)
 check('no caller decides it from the error text any more',
       # two callers pass the error text as the fallback; the link-first probe passes nil (no text at all)
       obj.count('nvmtl_needs_visible_link(_airs[name]') == 3 and obj.count('nvmtl_needs_visible_link(_airs[name], nil)') == 1

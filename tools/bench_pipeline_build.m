@@ -5,11 +5,14 @@
 // integer-only, so the CPU computes the exact expected output. Render pipelines share one vertex function with
 // distinct fragment functions, so several builds touch the same function object at once.
 //
-// build: clang -fobjc-arc -O1 -o bench_pipeline_build tools/bench_pipeline_build.m -framework Metal -framework Foundation
+// build: clang -fobjc-arc -O1 -o bench_pipeline_build tools/bench_pipeline_build.m -framework Metal -framework Foundation -framework IOKit
 //        NVMTL_PIPELINE_THREADS=1 ./bench_pipeline_build 48 24 0   (one build at a time, the old behaviour)
 //        ./bench_pipeline_build 48 24 3                              (default width, plus 3 stress rounds)
 // usage: bench_pipeline_build [kernels] [render] [stress-rounds]      default 32 kernels, 16 render pipelines, 0 stress rounds
 #import <Metal/Metal.h>
+#import <IOKit/IOKitLib.h>
+#import <objc/message.h>
+#include <dlfcn.h>
 #import <sys/sysctl.h>
 #import <stdio.h>
 #import <stdlib.h>
@@ -198,19 +201,65 @@ static int stress(id<MTLDevice> dev, id<MTLCommandQueue> q, int rounds) {
     return bad;
 }
 
+static int stress_functions(id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    NSError *error = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal; constant uint offset [[function_constant(0)]]; kernel void specialized(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = i + offset; }" options:nil error:&error];
+    if (!lib) { printf("async function library failed: %s\n", error.description.UTF8String); return 1; }
+    dispatch_group_t group = dispatch_group_create(); __block int bad = 0, completed = 0;
+    double started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+    for (unsigned n = 1; n <= 8; n++) for (unsigned kind = 0; kind < 2; kind++) {
+        MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+        uint32_t value = n; [cv setConstantValue:&value type:MTLDataTypeUInt atIndex:0];
+        NSMutableString *name = [@"specialized" mutableCopy];
+        MTLFunctionDescriptor *descriptor = [MTLFunctionDescriptor functionDescriptor]; descriptor.name = name; descriptor.constantValues = cv;
+        dispatch_group_enter(group);
+        void (^handler)(id<MTLFunction>,NSError *) = ^(id<MTLFunction> f,NSError *err) { @autoreleasepool {
+            __sync_fetch_and_add(&completed,1);
+            NSError *e = nil; id<MTLComputePipelineState> ps = f ? [dev newComputePipelineStateWithFunction:f error:&e] : nil;
+            id<MTLBuffer> b = [dev newBufferWithLength:128 options:MTLResourceStorageModeShared];
+            if (!f || err || !ps || !b) { __sync_fetch_and_add(&bad,1); dispatch_group_leave(group); return; }
+            memset(b.contents,0,128); id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:ps]; [enc setBuffer:b offset:0 atIndex:0];
+            [enc dispatchThreads:MTLSizeMake(32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)]; [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) __sync_fetch_and_add(&bad,1);
+            const uint32_t *v = b.contents; for (unsigned i = 0; i < 32; i++) if (v[i] != i+n) __sync_fetch_and_add(&bad,1);
+            dispatch_group_leave(group);
+        }};
+        if (!kind) [lib newFunctionWithName:name constantValues:cv completionHandler:handler];
+        else [lib newFunctionWithDescriptor:descriptor completionHandler:handler];
+        [name setString:@"mutated"]; [cv reset]; descriptor.name = @"mutated"; [descriptor.constantValues reset];
+    }
+    double submitted = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+    if (dispatch_group_wait(group,dispatch_time(DISPATCH_TIME_NOW,60*NSEC_PER_SEC))) { printf("async function specialization timed out\n"); return 1; }
+    double finished = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+    printf("async function snapshots: %d/16 callbacks, 512 compute values, %d wrong enqueue_ms=%.3f elapsed_ms=%.3f\n",completed,bad,submitted-started,finished-started);
+    return bad || completed != 16;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         const int nk = argc > 1 ? atoi(argv[1]) : 32, nr = argc > 2 ? atoi(argv[2]) : 16, rounds = argc > 3 ? atoi(argv[3]) : 0;
         if (nk < 1 || nk > 512 || nr < 0 || nr > 512) { printf("bad counts\n"); return 2; }
         rng_state = (uint32_t)(CFAbsoluteTimeGetCurrent() * 1000.0) ^ (uint32_t)getpid();
         int pc = 0, lc = 0; size_t sz = sizeof pc; sysctlbyname("hw.physicalcpu", &pc, &sz, NULL, 0); sz = sizeof lc; sysctlbyname("hw.logicalcpu", &lc, &sz, NULL, 0);
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLDevice> dev = nil;
+        const char *plugin = getenv("NM_TEST_PLUGIN"), *icd = getenv("NM_TEST_ICD");
+        if ((plugin || icd) && !dlopen(plugin ?: "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver", RTLD_NOW | RTLD_LOCAL)) return 3;
+        if (icd) setenv("NVMTL_ICD_LIB", icd, 1);
+        if (plugin) {
+            io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+            if (!svc) return 4;
+            dev = ((id(*)(id, SEL, mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc], NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
+            IOObjectRelease(svc);
+        } else dev = MTLCreateSystemDefaultDevice();
+        if (!dev || (icd && !dlopen(icd, RTLD_LAZY | RTLD_NOLOAD))) return 5;
+        id<MTLCommandQueue> q = [dev newCommandQueue]; if (!q) return 6;
         printf("device %s | %d physical / %d logical cores | %.0f GB\n", dev.name.UTF8String, pc, lc, NSProcessInfo.processInfo.physicalMemory / 1073741824.0);
         result_t s = build_set(dev, q, nk, nr, NO, "one at a time (sync)");
         result_t a = build_set(dev, q, nk, nr, YES, "all at once (async)");
         printf("async speed-up: %.2fx\n", s.secs / a.secs);
         int bad = (s.ok != s.total) + (a.ok != a.total);
-        if (rounds > 0) bad += stress(dev, q, rounds);
+        if (rounds > 0) { bad += stress(dev, q, rounds); bad += stress_functions(dev, q); }
         printf("%s\n", bad ? "FAIL" : "OK");
         return bad ? 1 : 0;
     }

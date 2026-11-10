@@ -20,6 +20,12 @@ for name in ('presentStatsNote(fHead, flipWaitUs(), true, false, false,', 'prese
              'presentStatsNote(fHead, flipWaitUs(), false, false, true, 0)'):
     assert source.count(name) == 1, 'submitConfig no longer reports: ' + name
 
+# The private ungated wait reports once at landing, using the captured submit bound (a later mode may differ).
+ungated_start = source.index('bool NVRMNVDAFramebuffer::waitLandedUngated(')
+ungated = source[ungated_start:source.index('NvBool NVRMNVDAFramebuffer::submitConfig(', ungated_start)]
+assert ungated.count('presentStatsNote(fHead, token.boundUs, true, over, false,') == 1
+assert 'gFlipLatchTimeouts' in ungated and 'gFlipLatchMaxUs' in ungated
+
 idle_control = helper.replace('const bool busy = w.flips >= 60 || w.over || w.late;', 'const bool busy = true;')
 assert idle_control != helper
 nowindow_control = helper.replace('    w = NVPresentWindow();\n', '')
@@ -122,3 +128,114 @@ for name, ctl in (('idle windows printed', idle_control), ('window never restart
     assert r.returncode != 0, 'negative control did not fail: ' + name
     print('control fires (%s)' % name)
 print('present stats: all arms pass')
+
+# Only the completed CPU copy path may update the new counter; zero-copy handling must not double count.
+accel = (root / 'kexts/NVRM/accel/nvrm-accel.cpp').read_text()
+start = accel.index('IOReturn NVDisplayPipe::performTransaction(')
+opening = accel.index('{', start)
+depth, end = 1, opening + 1
+while depth:
+    depth += {'{': 1, '}': -1}.get(accel[end], 0)
+    end += 1
+transaction = accel[start:end]
+assert transaction.count('OSAddAtomic64(1, &gCntIopCopies)') == 1
+assert transaction.index('OSAddAtomic64(1, &gCntIopCopies)') > transaction.index('dp[x] = sp[x]')
+assert 'sysctl_register_oid(&sysctl__debug_nvaccel_iop_copies)' in accel
+# Replay the actual CPU/frame reporter. Flip attempts and handled transactions are not completed outputs.
+import json
+reporter = root / 'tools/ws_frame_cost.sh'
+base_counters = dict(flips=100, copies=10, attempts=200, handled_h0=100, handled_h1=30, late=4, drop=2)
+before = dict(pid=7, monotonic_s=10.0, cpu_s=100.0, counters=base_counters)
+after = dict(pid=7, monotonic_s=20.0, cpu_s=100.24,
+             counters=dict(flips=200, copies=30, attempts=400, handled_h0=260, handled_h1=70, late=4, drop=2))
+
+def report(first, last):
+    with tempfile.TemporaryDirectory() as directory:
+        path = pathlib.Path(directory) / 'samples.json'
+        path.write_text(json.dumps(dict(before=first, after=last)))
+        return subprocess.run(['bash', str(reporter), '--replay', str(path), '--json'],
+                              capture_output=True, text=True, timeout=15)
+
+r = report(before, after)
+assert r.returncode == 0, r.stderr
+metrics = json.loads(r.stdout)
+assert metrics['completed_updates'] == 120 and abs(metrics['cpu_ms_per_update'] - 2.0) < 1e-8, metrics
+assert metrics['attempts'] == 200 and metrics['handled_h0'] == 160, metrics
+# Old kernels cannot report all completed updates: never invent zero CPU copies or a one-frame denominator.
+missing = dict(before, counters=dict(base_counters, copies=None))
+unknown = json.loads(report(missing, dict(after, counters=dict(after['counters'], copies=None))).stdout)
+assert unknown['completed_updates'] is None and unknown['cpu_ms_per_update'] is None, unknown
+idle = json.loads(report(before, dict(after, counters=base_counters)).stdout)
+assert idle['completed_updates'] == 0 and idle['cpu_ms_per_update'] is None, idle
+reset = report(before, dict(after, counters=dict(after['counters'], flips=99)))
+assert reset.returncode != 0 and 'reset' in reset.stderr.lower(), reset.stderr
+restarted = report(before, dict(after, pid=8))
+assert restarted.returncode != 0 and 'WindowServer' in restarted.stderr, restarted.stderr
+print('CPU reporter: completed-update denominator, missing counters, idle, reset and process restart pass')
+
+# A/B diagnostics must preserve missing counters and use measured time, not ten-second integer rates.
+first = dict(before, counters=dict(base_counters, flip_us_sum=1000, latch_timeouts=5, fail=2))
+last = dict(after, monotonic_s=22.5,
+            counters=dict(after['counters'], flip_us_sum=41000, latch_timeouts=8, fail=2))
+r = report(first, last)
+assert r.returncode == 0, r.stderr
+ab = json.loads(r.stdout)
+assert ab.get('flip_call_mean_us') == 200.0, ab
+assert ab['latch_timeouts'] == 3 and ab['fail'] == 0, ab
+assert ab['elapsed_s'] == 12.5 and ab['updates_per_s'] == 9.6, ab
+unknown = json.loads(report(before, after).stdout)
+assert unknown['flip_call_mean_us'] is None and unknown['latch_timeouts'] is None and unknown['fail'] is None, unknown
+idle_ab = json.loads(report(first, dict(last, counters=first['counters'])).stdout)
+assert idle_ab['flip_call_mean_us'] is None, idle_ab
+reset_ab = report(first, dict(last, counters=dict(last['counters'], flip_us_sum=999)))
+assert reset_ab.returncode != 0 and 'reset' in reset_ab.stderr.lower(), reset_ab.stderr
+print('A/B diagnostics: measured elapsed, missing/reset counters, zero attempts and timeout-not-failure pass')
+
+# Run the actual privileged wrapper with fake commands: no GUI, sysctl write, or root privilege.
+import os
+ab_reporter = root / 'tools/ws_present_ab.sh'
+with tempfile.TemporaryDirectory() as directory:
+    directory = pathlib.Path(directory)
+    commands = {
+        'id': '#!/bin/bash\necho 0\n',
+        'stat': '#!/bin/bash\necho fixture\n',
+        'sysctl': '''#!/bin/bash
+if [ "$1" = -n ]; then
+  [ "${AB_MISSING:-0}" = 0 ] || exit 1
+  /bin/cat "$AB_STATE"
+else
+  echo "${2##*=}" > "$AB_STATE"
+  echo "$2" >> "$AB_WRITES"
+fi
+''',
+        'launchctl': '#!/bin/bash\n/bin/sleep 0.2\n',
+        'sleep': '#!/bin/bash\n/bin/sleep 0.02\n',
+        'python3': '#!/bin/bash\n/bin/cat >/dev/null\necho fixture-metrics\nexit "${AB_REPORT_FAIL:-0}"\n',
+    }
+    for name, contents in commands.items():
+        path = directory / name
+        path.write_text(contents)
+        path.chmod(0o755)
+    state, writes = directory / 'state', directory / 'writes'
+    environment = dict(os.environ, PATH=str(directory) + ':/usr/bin:/bin', WL='/usr/bin/true',
+                       AB_STATE=str(state), AB_WRITES=str(writes))
+
+    def ab_run(values, **overrides):
+        state.write_text('1\n')
+        writes.write_text('')
+        result = subprocess.run(['/bin/bash', str(ab_reporter), *values],
+                                env=dict(environment, **overrides), capture_output=True, text=True, timeout=5)
+        return result, writes.read_text().splitlines(), state.read_text().strip()
+
+    r, changes, final = ab_run([])
+    assert r.returncode == 0 and not changes and final == '1', (r, changes, final)
+    r, changes, final = ab_run(['0', '1'])
+    assert r.returncode == 0 and changes == ['debug.nvrmfb_flip_ungated=0', 'debug.nvrmfb_flip_ungated=1',
+                                            'debug.nvrmfb_flip_ungated=1'] and final == '1', (r, changes, final)
+    r, changes, final = ab_run(['0'], AB_REPORT_FAIL='2')
+    assert r.returncode != 0 and final == '1' and changes[-1].endswith('=1'), (r, changes, final)
+    r, changes, final = ab_run(['0'], AB_MISSING='1')
+    assert r.returncode != 0 and not changes and 'unavailable' in r.stderr, (r, changes)
+    r, changes, final = ab_run(['0', 'invalid'])
+    assert r.returncode != 0 and not changes and '0 or 1' in r.stderr, (r, changes)
+print('A/B wrapper: default read-only, explicit interleave/restore, failed reporter restore, missing gate and invalid input pass')

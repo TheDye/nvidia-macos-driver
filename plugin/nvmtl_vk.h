@@ -81,6 +81,8 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void **fbs; unsigned nfb, capfb;
                  nvk_setref *sets; unsigned nsets, capsets;
                  void *address_pages; unsigned address_count;
+                 /* Optional recording-local immutable snapshot histories; freed before pages/sets recycle. */
+                 void *address_history, *descriptor_history;
                  unsigned nobind, skipped;
                  void *dcache[32]; void *dcachepool; unsigned ndcache, dcache_gl_uniform;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;

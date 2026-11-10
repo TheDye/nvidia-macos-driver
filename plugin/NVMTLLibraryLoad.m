@@ -29,7 +29,7 @@ static inline const char *nvmtl_pick_ll(const char *staged, const char *dev) {
     return access(staged, R_OK) == 0 ? staged : dev;
 }
 #ifndef NVMTL_XLATE_LIB
-#define NVMTL_XLATE_LIB nvmtl_pick_ll("/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib", \
+#define NVMTL_XLATE_LIB nvmtl_pick_ll("/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib", \
                                       "/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib")
 #endif
 
@@ -504,6 +504,22 @@ uint32_t nvmtl_air_text_flags(NSString *ll) {
     if ([ll rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound) f |= NVMTL_AIRF_ISECT_TABLE;
     if (keep) objc_setAssociatedObject(ll, NVMTL_AIRFLAGS_KEY, @(f), OBJC_ASSOCIATION_RETAIN);
     return f;
+}
+// First 8 bytes of SHA-256 of the AIR text (as UTF-8 up to its first NUL): the module key the pipeline key line, profile
+// rows and fault-context dispatch records carry. Every dispatch records it, and VideoToolbox makes a new function for
+// every transfer, so hashing per function object cost 40% of a transfer; keep it on the marked, never-edited text.
+static const void *NVMTL_AIRKEY64_KEY = &NVMTL_AIRKEY64_KEY;
+uint64_t nvmtl_air_text_key(NSString *ll) {
+    if (!ll.length) return 0;
+    const BOOL keep = ll.length >= 4096 && objc_getAssociatedObject(ll, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *have = keep ? objc_getAssociatedObject(ll, NVMTL_AIRKEY64_KEY) : nil;
+    if (have) return have.unsignedLongLongValue;
+    const char *s = ll.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH]; uint64_t v = 0;
+    if (!s) return 0;
+    CC_SHA256(s, (CC_LONG)strlen(s), dg);
+    for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
+    if (keep) objc_setAssociatedObject(ll, NVMTL_AIRKEY64_KEY, @(v), OBJC_ASSOCIATION_RETAIN);
+    return v;
 }
 static NVMTLAirDigest *nvmtl_air_state(NSString *ll) {
     if (!ll) return nil;
@@ -1165,7 +1181,7 @@ static NSString *nvmtl_idx_path(NSData *key) {
     return [nvmtl_aircache_dir() stringByAppendingPathComponent:@(name)];
 }
 static _Atomic unsigned long gLazyLibs, gLazyNames, gLazyForced, gLazyFail;
-@interface NVMTLLazyAirs : NSDictionary { NSDictionary *_slot; NSArray *_blob; NSMutableArray *_text; os_unfair_lock _lk; }
+@interface NVMTLLazyAirs : NSDictionary { NSDictionary *_slot; NSArray *_blob; NSMutableArray *_text, *_decodeLocks; os_unfair_lock _lk; }
 - (instancetype)initWithSlots:(NSDictionary *)slot blobs:(NSArray *)blob;
 - (NSUInteger)blobBytes;
 @end
@@ -1175,7 +1191,8 @@ static _Atomic unsigned long gLazyLibs, gLazyNames, gLazyForced, gLazyFail;
     if (!(self = [super init])) return nil;
     _slot = [slot copy]; _blob = [blob copy]; _lk = OS_UNFAIR_LOCK_INIT;
     _text = [NSMutableArray arrayWithCapacity:blob.count];
-    for (NSUInteger i = 0; i < blob.count; i++) [_text addObject:(id)kCFNull];
+    _decodeLocks = [NSMutableArray arrayWithCapacity:blob.count];
+    for (NSUInteger i = 0; i < blob.count; i++) { [_text addObject:(id)kCFNull]; [_decodeLocks addObject:(id)kCFNull]; }
     const unsigned long libs = atomic_fetch_add(&gLazyLibs, 1) + 1; atomic_fetch_add(&gLazyNames, slot.count);
     if (!(libs & (libs - 1))) nvlog("lazy air: %lu disk-indexed libraries hold %lu names, %lu texts decoded on first use, %lu failed",
                                     libs, atomic_load(&gLazyNames), atomic_load(&gLazyForced), atomic_load(&gLazyFail));
@@ -1191,22 +1208,37 @@ static _Atomic unsigned long gLazyLibs, gLazyNames, gLazyForced, gLazyFail;
 - (id)objectForKey:(id)key {
     NSNumber *s = _slot[key]; if (!s) return nil;
     const NSUInteger i = s.unsignedIntegerValue;
-    os_unfair_lock_lock(&_lk); id t = _text[i]; os_unfair_lock_unlock(&_lk);
-    if (t != (id)kCFNull) return t;
-    NSString *ll = nvmtl_air_to_text(_blob[i]);
-    if (!ll) {
-        atomic_fetch_add(&gLazyFail, 1);
-        nvlog("lazy air: blob %lu (asked as \"%s\") has no text - the function is absent, as in the uncached index",
-              (unsigned long)i, [key description].UTF8String);
-        return nil;
-    }
     os_unfair_lock_lock(&_lk);
-    if (_text[i] == (id)kCFNull) { _text[i] = ll; atomic_fetch_add(&gLazyForced, 1); } else ll = _text[i];
+    id t = _text[i]; NSLock *decode = nil;
+    if (t == (id)kCFNull) {
+        id stored = _decodeLocks[i];
+        decode = stored == (id)kCFNull ? [NSLock new] : stored;
+        if (stored == (id)kCFNull) _decodeLocks[i] = decode;
+    }
     os_unfair_lock_unlock(&_lk);
-    const unsigned long f = atomic_load(&gLazyForced);
-    if (!(f & (f - 1))) nvlog("lazy air: %lu texts decoded on first use across %lu disk-indexed libraries holding %lu names (%lu failed)",
-                              f, atomic_load(&gLazyLibs), atomic_load(&gLazyNames), atomic_load(&gLazyFail));
-    return ll;
+    if (t != (id)kCFNull) return t;
+    // Parallel aliases share one attempt, including its failure. A later call can retry.
+    const BOOL owner = [decode tryLock];
+    if (!owner) [decode lock];
+    @try {
+        os_unfair_lock_lock(&_lk); t = _text[i]; os_unfair_lock_unlock(&_lk);
+        if (t != (id)kCFNull) return t;
+        if (!owner) return nil;
+        NSString *ll = nvmtl_air_to_text(_blob[i]);
+        if (!ll) {
+            atomic_fetch_add(&gLazyFail, 1);
+            nvlog("lazy air: blob %lu (asked as \"%s\") has no text - the function is absent, as in the uncached index",
+                   (unsigned long)i, [key description].UTF8String);
+            return nil; // A later caller can retry a failed decode.
+        }
+        os_unfair_lock_lock(&_lk);
+        _text[i] = ll; atomic_fetch_add(&gLazyForced, 1);
+        os_unfair_lock_unlock(&_lk);
+        const unsigned long f = atomic_load(&gLazyForced);
+        if (!(f & (f - 1))) nvlog("lazy air: %lu texts decoded on first use across %lu disk-indexed libraries holding %lu names (%lu failed)",
+                                f, atomic_load(&gLazyLibs), atomic_load(&gLazyNames), atomic_load(&gLazyFail));
+        return ll;
+    } @finally { [decode unlock]; }
 }
 @end
 static NSDictionary *nvmtl_index_from_record(NSData *lib, NSDictionary *rec, NSDictionary **stageOut, NSDictionary **airOut, NSArray **extOut) {
@@ -1537,6 +1569,20 @@ static int nvmtl_reflect_air(NVMTLFunction *function, NSString *ll, NSString *st
     return xlate_refl(ll.UTF8String, stage.UTF8String, j, jn, e, elen);
 }
 
+// The reflection memo hands out the same NSData for the same module and constants; VideoToolbox, Core Image and MPS
+// make a new function object per use, so each one parsed the same JSON again (several times per dispatch). Keep the
+// immutable parse on the immutable data.
+static const void *NVMTL_REFLPARSE_KEY = &NVMTL_REFLPARSE_KEY;
+NSDictionary *nvmtl_reflection_parse(NSData *d)
+{
+    if (!d.length) return nil;
+    id have = objc_getAssociatedObject(d, NVMTL_REFLPARSE_KEY);
+    if (have) return have == [NSNull null] ? nil : have;
+    id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+    if (![obj isKindOfClass:[NSDictionary class]]) obj = nil;
+    objc_setAssociatedObject(d, NVMTL_REFLPARSE_KEY, obj ?: [NSNull null], OBJC_ASSOCIATION_RETAIN);
+    return obj;
+}
 static _Atomic unsigned long gRfHit, gRfMiss, gRfStored;
 static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, NSString *stage, char *e, size_t elen)
 {
@@ -1632,7 +1678,7 @@ NSDictionary *nvmtl_function_reflection(NVMTLFunction *function)
         NSData *d = nvmtl_reflect_air_cached(function, ll, stage, e, sizeof e);
         if (!d) { nvlog("reflection for %s FAILED: %s", name.UTF8String, e); return nil; }
         size_t jn = d.length;
-        NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+        NSDictionary *refl = nvmtl_reflection_parse(d);
         if ([refl isKindOfClass:[NSDictionary class]] && refl.count) function->_refl = refl;
         else nvlog("reflection for %s: JSON did not parse (%zu bytes)", name.UTF8String, jn);
         return function->_refl.count ? function->_refl : nil;
@@ -1920,9 +1966,25 @@ static BOOL nvmtl_air_grid_only_scan(NSString *ll, NSString *fname)
     }
     return NO;
 }
+// The scan reads the whole module; a pipeline remembers its answer, but VideoToolbox makes a new pipeline per transfer.
+// Remember it per AIR text object (weak keys) and entry name.
 BOOL nvmtl_air_grid_only(NVMTLFunction *fn)
 {
-    return fn ? nvmtl_air_grid_only_scan(fn->_air, fn->_fname) : NO;
+    if (!fn || !fn->_air.length || !fn->_fname.length) return NO;
+    if (!(fn->_air.length >= 4096 && objc_getAssociatedObject(fn->_air, NVMTL_AIRTEXT_KEY)))
+        return nvmtl_air_grid_only_scan(fn->_air, fn->_fname);   // not known immutable: no cache
+    static NSMapTable *t; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT; static dispatch_once_t once;
+    dispatch_once(&once, ^{ t = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                                                       valueOptions:NSPointerFunctionsStrongMemory]; });
+    os_unfair_lock_lock(&lk); NSNumber *v = [[t objectForKey:fn->_air] objectForKey:fn->_fname]; os_unfair_lock_unlock(&lk);
+    if (v) return v.boolValue;
+    const BOOL r = nvmtl_air_grid_only_scan(fn->_air, fn->_fname);
+    os_unfair_lock_lock(&lk);
+    NSMutableDictionary *m = [t objectForKey:fn->_air];
+    if (!m) { m = [NSMutableDictionary new]; [t setObject:m forKey:fn->_air]; }
+    m[[fn->_fname copy]] = @(r);
+    os_unfair_lock_unlock(&lk);
+    return r;
 }
 
 // One `air.struct_type_info` tuple: members of `i32 offset, i32 size, i32 count, !"type", !"name",
@@ -2022,7 +2084,7 @@ NSArray<NSDictionary *> *nvmtl_embedded_bindings(NVMTLFunction *function)
             function->_embedded = @[];
             return function->_embedded;
         }
-        NSDictionary *refl = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+        NSDictionary *refl = nvmtl_reflection_parse(d);
         NSArray *all = refl[@"bindings"];
         NSMutableArray *mine = [NSMutableArray new];
         if ([all isKindOfClass:[NSArray class]]) {
@@ -2366,6 +2428,9 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
+    // Every form names "function_table"; one byte scan rules most modules out before the eight Unicode searches.
+    const char *u = air.UTF8String;
+    if (!u || !strstr(u, "function_table")) return NO;
     for (NSString *f in forms)
         if ([air rangeOfString:f].location != NSNotFound) return YES;
     return NO;
@@ -2379,19 +2444,36 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
 // 26 that is the system's icon and Liquid Glass shaders: icons missing pieces, glass menus drawn as a flat tint.
 // The translator lists the references itself, so ask it. The known messages stay as a fallback for a translator
 // that cannot answer, so a query that cannot run never reads as "no references".
+// The answer depends only on the immutable AIR text, but VideoToolbox, Core Image and MPS ask it for the same
+// library function on every specialization: measured 80% of a VTPixelTransfer call was this scan. Remember the
+// translator's answer per AIR string object (weak keys, so a released library drops its rows). The error-text
+// fallback is not cached.
+static int nvmtl_vlink_cached(NSString *air)
+{
+    static NSMapTable *t; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT; static dispatch_once_t once;
+    dispatch_once(&once, ^{ t = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality
+                                                       valueOptions:NSPointerFunctionsStrongMemory]; });
+    // Only text nvmtl_air_to_text made is known never to be edited; any other string is asked every time.
+    const BOOL keep = air.length >= 4096 && objc_getAssociatedObject(air, NVMTL_AIRTEXT_KEY) != nil;
+    NSNumber *v = nil;
+    if (keep) { os_unfair_lock_lock(&lk); v = [t objectForKey:air]; os_unfair_lock_unlock(&lk); }
+    if (v) return v.boolValue;
+    if (!(air.length && nvmtl_xlate_ready() && xlate_vrefs)) return -1;
+    uint8_t *out = NULL; size_t len = 0; char e[256] = {0};
+    if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) != 0) return -1;
+    id refs = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:len] options:0 error:NULL];
+    xlate_free(out, len);
+    if (![refs isKindOfClass:[NSArray class]]) return -1;
+    // the query lists direct references only; a function that calls through a visible or intersection
+    // function table has none, and nvmtl_link_stage links it from the table candidates
+    const BOOL need = [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
+    if (keep) { os_unfair_lock_lock(&lk); [t setObject:@(need) forKey:air]; os_unfair_lock_unlock(&lk); }
+    return need;
+}
 BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
 {
-    if (air.length && nvmtl_xlate_ready() && xlate_vrefs) {
-        uint8_t *out = NULL; size_t len = 0; char e[256] = {0};
-        if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) == 0) {
-            id refs = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:len] options:0 error:NULL];
-            xlate_free(out, len);
-            // the query lists direct references only; a function that calls through a visible or intersection
-            // function table has none, and nvmtl_link_stage links it from the table candidates
-            if ([refs isKindOfClass:[NSArray class]])
-                return [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
-        }
-    }
+    const int cached = air.length ? nvmtl_vlink_cached(air) : -1;
+    if (cached >= 0) return cached;
     return why && ([why rangeOfString:@"visible function reference"].location != NSNotFound
                 || [why rangeOfString:@"Metal visible function table"].location != NSNotFound
                 || [why rangeOfString:@"no linked function supplies it"].location != NSNotFound
@@ -3251,9 +3333,12 @@ static NSString *nvmtl_mesh_text(uint8_t *p, size_t n) {
 }
 - (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)md options:(MTLPipelineOption)o
     completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)h {
-    NSError *e = nil; MTLRenderPipelineReflection *rf = nil;
-    id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithMeshDescriptor:md options:o reflection:&rf error:&e];
-    if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, rf, e); });
+    MTLMeshRenderPipelineDescriptor *snapshot = [md copy];
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        NSError *e = nil; MTLRenderPipelineReflection *rf = nil;
+        id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithMeshDescriptor:snapshot options:o reflection:&rf error:&e];
+        if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, rf, e); });
+    }}];
 }
 @end
 

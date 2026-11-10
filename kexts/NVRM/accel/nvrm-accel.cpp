@@ -1242,6 +1242,7 @@ public:
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopOkHead[kNvMaxFB];
+static SInt64 gCntIopCopies;  // completed CPU copies only (zero-copy flips excluded)
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
@@ -1375,6 +1376,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+    OSAddAtomic64(1, &gCntIopCopies);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
     unsigned nz = 0, varied = 0; const unsigned first = src[0] & 0xffffffu;
@@ -1452,6 +1454,7 @@ NVACCEL_CNT(nvaccel_iop_ok_h1,        gCntIopOkHead[1],   "frames copied to head
 NVACCEL_CNT(nvaccel_iop_ok_h2,        gCntIopOkHead[2],   "frames copied to head 2's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h3,        gCntIopOkHead[3],   "frames copied to head 3's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h4,        gCntIopOkHead[4],   "frames copied to head 4 (an Intel built-in panel, NMIntelFB)");
+NVACCEL_CNT(nvaccel_iop_copies,       gCntIopCopies,      "completed CPU frame copies (all heads)");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_published, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadsPublished, 0,
             "bit i = head i's framebuffer has published to the accelerator");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsRegistered, 0,
@@ -1623,6 +1626,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copies);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
     gSysctlInstalled = true;

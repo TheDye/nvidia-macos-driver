@@ -156,3 +156,69 @@ with tempfile.TemporaryDirectory() as directory:
                     str(path / 'test.m'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
     subprocess.run([str(path / 'test'), 'shared'], check=True)
+
+# The IOSurface VRAM import cache: wrappers of one surface share one import; the last put keeps it until it idles out;
+# a put of an uncached import destroys it; distinct surfaces and sizes get their own imports; the kill switch bypasses it.
+device = (root / 'plugin/NVMTLDevice.m').read_text()
+c0 = device.index('#include <os/lock.h>\n#define NVMTL_VRAMC_N')
+c1 = device.index('static int nvmtl_surface_image_create(')
+cache_src = device[c0:c1]
+cache_test = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+typedef struct __IOSurface { uint32_t id; int rc; } *IOSurfaceRef;
+static uint32_t IOSurfaceGetID(IOSurfaceRef s) { return s->id; }
+static void CFRetain(IOSurfaceRef s) { s->rc++; }
+static void CFRelease(IOSurfaceRef s) { s->rc--; }
+typedef struct { void *buf; size_t size; } nvk_buffer;
+static int imports, destroys;
+static int nvmtl_vk_surface_vram(uint32_t id, uint32_t plane, size_t need, nvk_buffer *o)
+{ (void)plane; imports++; o->buf = (void *)(uintptr_t)(0x1000 * imports + id); o->size = need; return 0; }
+static void nvmtl_vk_buffer_destroy(nvk_buffer *b) { if (b->buf) destroys++; memset(b, 0, sizeof *b); }
+static void nvlog(const char *f, ...) { (void)f; }
+static uint64_t fake_now;
+#define clock_gettime_nsec_np(c) (fake_now)
+''' + cache_src + r'''
+int main(int argc, char **argv) {
+    struct __IOSurface a = {7, 1}, b = {8, 1};
+    nvk_buffer x, y, z, w;
+    if (argc > 1) {   /* NVMTL_NO_VRAM_IMPORT_CACHE=1 */
+        assert(!nvmtl_surface_vram_get(&a, 64, &x) && !nvmtl_surface_vram_get(&a, 64, &y) && imports == 2);
+        nvmtl_surface_vram_put(&x); nvmtl_surface_vram_put(&y); assert(destroys == 2 && a.rc == 1);
+        puts("PASS: kill switch keeps one import per wrapper"); return 0;
+    }
+    assert(!nvmtl_surface_vram_get(&a, 64, &x) && imports == 1 && a.rc == 2);
+    assert(!nvmtl_surface_vram_get(&a, 64, &y) && imports == 1 && y.buf == x.buf);
+    assert(!nvmtl_surface_vram_get(&a, 128, &z) && imports == 2 && z.buf != x.buf);   /* other size: own import */
+    assert(!nvmtl_surface_vram_get(&b, 64, &w) && imports == 3 && w.buf != x.buf);    /* other surface: own import */
+    nvmtl_surface_vram_put(&x); nvmtl_surface_vram_put(&y); assert(destroys == 0 && !x.buf);
+    fake_now += 500000000ull;   /* a new wrapper inside the idle window reuses it */
+    assert(!nvmtl_surface_vram_get(&a, 64, &x) && imports == 3);
+    nvmtl_surface_vram_put(&x);
+    fake_now += 2000000000ull;  /* idle past its time: the next call frees it and releases the surface */
+    nvmtl_surface_vram_put(&z); nvmtl_surface_vram_put(&w);
+    assert(destroys == 1 && a.rc == 2);   /* z and w just went idle; the 64-byte import of a is gone */
+    fake_now += 2000000000ull; nvk_buffer q; assert(!nvmtl_surface_vram_get(&b, 32, &q));
+    assert(destroys == 3 && a.rc == 1 && b.rc == 2);
+    nvk_buffer stray = { (void *)0xdead, 1 }; nvmtl_surface_vram_put(&stray); assert(destroys == 4);
+    /* a full table evicts the oldest idle entry; with none idle the import stays uncached and its put destroys it */
+    enum { MANY = NVMTL_VRAMC_N + 12 }; struct __IOSurface many[MANY]; nvk_buffer held[MANY]; nvmtl_surface_vram_put(&q);
+    for (int i = 0; i < MANY; i++) { many[i] = (struct __IOSurface){100 + i, 1}; assert(!nvmtl_surface_vram_get(&many[i], 16, &held[i])); }
+    int before = destroys; for (int i = 0; i < MANY; i++) nvmtl_surface_vram_put(&held[i]);
+    assert(destroys - before == MANY - NVMTL_VRAMC_N);   /* the idle q was evicted for the last slot; 12 stayed uncached */
+    for (int i = 0; i < MANY; i++) assert(many[i].rc == (i < NVMTL_VRAMC_N ? 2 : 1));
+    puts("PASS: wrappers share one VRAM import per surface and size, idle imports expire and release their surface");
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    path = pathlib.Path(directory)
+    (path / 'cache.c').write_text(cache_test)
+    subprocess.run(['clang', '-Wall', '-Werror', str(path / 'cache.c'), '-o', str(path / 'cache')], check=True)
+    subprocess.run([str(path / 'cache')], check=True)
+    import os
+    subprocess.run([str(path / 'cache'), 'off'], check=True, env=dict(os.environ, NVMTL_NO_VRAM_IMPORT_CACHE='1'))

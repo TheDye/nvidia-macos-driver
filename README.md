@@ -38,9 +38,9 @@ Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─
 | Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
 | Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
-| GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/615.78.08` | NVIDIA, unmodified |
+| GPU firmware (GSP) | `/Library/NullMoth/nvfw/` (versioned NVIDIA payload) | NVIDIA, unmodified |
 
-The kernel side runs NVIDIA's own open GPU kernel modules (r610) under macOS. NVRMFB is the display framebuffer,
+The kernel side runs NVIDIA's own open GPU kernel modules (620.70.06) under macOS. NVRMFB is the display framebuffer,
 NVAccel the accelerator WindowServer composites through, NVRMAGDC the display-policy shim.
 
 ## Install — by hand
@@ -152,7 +152,18 @@ sudo ./uninstall.sh && sudo shutdown -r now
 
 ## Build from source
 
-Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `615.78.08`.
+Requires macOS with Xcode 16 and an SDK containing `Kernel.framework/Headers`, Rust (stable),
+Meson/Ninja, Vulkan headers, and NVIDIA's `open-gpu-kernel-modules` at tag `620.70.06`
+(the 2.8 kernel/firmware baseline, not the older 615 tag).
+
+These are maintainer workspace scripts, not a clean-checkout build recipe: configure their
+`$HOME/nvmtl-build` source/output paths first. `build_xlate.sh` also expects `LIVE/xlate.exports`
+and `shipcheck.py`; `build_plugin.sh` expects `$HOME/Vulkan-Headers/include` and `LIVE/plugin`;
+`build263.sh` expects the patched Mesa export at `rebase263/mesa` without `.git`, its Meson
+build dependencies (including `mesa-clc`), and prepared tool paths. Kernel builds need the
+NVIDIA tree's generated Darwin headers/`compile_cmds.sh`; `OGKM` selects that tree (its legacy
+default directory name is `ogkm610`). A compiler alone is insufficient. The commands below
+are component entry points, not a complete four-kext package or installation procedure.
 
 ```bash
 build/build_xlate.sh
@@ -165,6 +176,11 @@ build/accel_build_all.sh kexts/NVRM <out>
 In order: the translator (`libnvmtl_translate.dylib`); the plugin (`NVMTLDriver.bundle`; `RELEASE=1` strips every
 diagnostic); NVK (apply `nvk/nvk-macos.patch` to Mesa `17ca6174` first); the kexts; and NVAccel for macOS 15 and 26
 (`NM_TAHOE=1`), written to `<out>/15` and `<out>/26`.
+
+CPU policy regressions: `python3 tools/test_card_support.py`, `python3 tools/test_angle_chrome_family.py`,
+and `python3 tools/test_angle_optin.py` (macOS developer tools; no driver installation or GPU required).
+See [card/browser limits](docs/CARD-SUPPORT.md#ada-and-browser-limits-public-reports-checked-2026-11-10)
+before treating a matching Ada ID or an ANGLE override as application validation.
 
 Rebuild both accelerators whenever `nvrm_vram_abi.h` or `nvrm_gpuva_abi.h` changes: an accelerator built against an
 older ABI loads, but NVRMFB refuses all its VRAM requests and the desktop stays black.

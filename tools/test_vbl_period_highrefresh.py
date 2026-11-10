@@ -2,10 +2,9 @@
 """The fallback vblank period must reach the real rate of a high-refresh panel.
 
 When NVKMS refuses the hardware vblank, vblPeriodAbs() paces the software timer that delivers vblanks
-to WindowServer. The accepted range has to cover real panels up to 500 Hz; a 250 Hz floor dropped
-280/300/360 Hz panels to the 60 Hz default, so WindowServer's frame delivery beat against the
-scan-out. The real vblPeriodAbs() body is lifted from nvrm-fb.cpp and exercised; the negative control
-restores the old 4 ms floor and proves a 300 Hz panel then reports a 60 Hz period."""
+to WindowServer. Match the 1 ms minimum already used by flipWaitUs, including 540/600 Hz panels
+that a 2 ms floor incorrectly dropped to 60 Hz. The real vblPeriodAbs() body is lifted and exercised;
+negative controls restore both the 2 ms and 4 ms floors."""
 import pathlib
 import re
 import subprocess
@@ -25,7 +24,7 @@ while depth:
     i += 1
 body = source[body_open:i-1]
 
-assert 'q >= 2000000ull' in body, 'the fallback vblank floor no longer covers high-refresh panels (>250 Hz)'
+assert 'q >= 1000000ull' in body, 'the fallback and flip wait must agree on the minimum panel period'
 
 fixture = r'''
 #include <cassert>
@@ -56,8 +55,11 @@ int main() {
     assert(at(2560,1440,240).vblPeriodAbs() == nsFor(240));
     assert(at(2560,1440,165).vblPeriodAbs() == nsFor(165));
     assert(at(1920,1080,60).vblPeriodAbs()  == nsFor(60));
+    assert(at(1920,1080,540).vblPeriodAbs() == nsFor(540));
+    assert(at(1920,1080,600).vblPeriodAbs() == nsFor(600));
+    assert(at(1920,1080,1000).vblPeriodAbs() == nsFor(1000));
     // Out of the plausible panel range still falls back to 60 Hz (16666667 ns).
-    assert(at(1920,1080,600).vblPeriodAbs() == 16666667ull); // sub-2 ms: implausible clock
+    assert(at(1920,1080,1001).vblPeriodAbs() == 16666667ull); // below the supported 1 ms floor
     assert(at(1920,1080,10).vblPeriodAbs()  == 16666667ull); // over 50 ms
     { FB z; assert(z.vblPeriodAbs() == 16666667ull); }       // no mode yet
     printf("OK\n");
@@ -77,11 +79,12 @@ def build_and_run(vbl_body):
 r = build_and_run(body)
 assert r.returncode == 0 and r.stdout.strip() == 'OK', \
     f'fixed vblPeriodAbs failed: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}'
-print('fixed source: PASS (280/300/360 Hz report their real period; 240/165/60 unchanged)')
+print('fixed source: PASS (60 through 1000 Hz; invalid/missing timings fall back)')
 
-control = body.replace('q >= 2000000ull', 'q >= 4000000ull')
-assert control != body, 'could not build the negative control'
-r = build_and_run(control)
-assert r.returncode != 0, 'negative control passed -- the test does not detect the 250 Hz floor bug'
-print('negative control (4 ms / 250 Hz floor): FAILS as required (300 Hz fell back to 60 Hz)')
+for floor in ('2000000ull', '4000000ull'):
+    control = body.replace('q >= 1000000ull', 'q >= ' + floor)
+    assert control != body, 'could not build the negative control'
+    r = build_and_run(control)
+    assert r.returncode != 0, 'negative control passed -- high refresh regression undetected'
+    print(f'negative control ({floor} floor): FAILS as required')
 print('PASS')

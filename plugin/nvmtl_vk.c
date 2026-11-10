@@ -3909,7 +3909,51 @@ static void nvmtl_perf_submit(unsigned sets, const uint64_t *pt)
             (unsigned long long)g_wit_ok, (unsigned long long)g_wit_waited, (unsigned long long)g_wit_leak,
             (unsigned long long)g_wit_blind, (unsigned long long)g_wit_ctl_fired, (unsigned long long)g_wit_ctl_run, s);
 }
+/* 0: baseline (default), 1: tables, 2: tables + conservative FS descriptor history.
+ * Entries are recording-local: retirement drops histories before recycling pages or sets. */
+static int nvmtl_snapshot_reuse(void)
+{
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("NVMTL_SNAPSHOT_REUSE"); mode = e ? atoi(e) : 0;
+        if (mode < 0 || mode > 2) mode = 0; }
+    return mode;
+}
+#define NVMTL_ADDRESS_HISTORY 8
+#define NVMTL_DESCRIPTOR_HISTORY 64
+typedef struct { VkDescriptorBufferInfo info; const uint64_t *words; } nvmtl_address_entry;
+typedef struct { unsigned next, count; nvmtl_address_entry e[NVMTL_ADDRESS_HISTORY]; } nvmtl_address_history;
+typedef struct {
+    VkDescriptorSet set; unsigned idx; uint64_t mask[4];
+    void *handles[NVMTL_NTEX + NVMTL_NSAMP]; VkDescriptorBufferInfo address;
+} nvmtl_descriptor_entry;
+typedef struct { unsigned next, count; nvmtl_descriptor_entry e[NVMTL_DESCRIPTOR_HISTORY]; } nvmtl_descriptor_history;
 static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBufferInfo *out) {
+    nvmtl_address_history *history = NULL;
+    uint64_t logical[NVMTL_NBUF + NVMTL_NTEX];
+    nvmtl_bindtable *t = c->table;
+    if (nvmtl_snapshot_reuse()) {
+        history = c->address_history;
+        if (!history) history = c->address_history = calloc(1, sizeof *history);
+    }
+    if (history) {
+        for (unsigned i = 0; i < NVMTL_NBUF; i++) {
+            const nvmtl_slot *s = t ? &t->s[which][i] : NULL;
+            logical[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : nvmtl_vk_buffer_address(&g_dummyBuf);
+        }
+        for (unsigned i = 0; i < NVMTL_NTEX; i++) {
+            const nvmtl_slot *s = t ? &t->s[which][NVMTL_NBUF + i] : NULL;
+            logical[NVMTL_NBUF + i] = s && s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+        }
+        for (unsigned k = 0; k < history->count; k++) {
+            const nvmtl_address_entry *e = &history->e[(history->next + NVMTL_ADDRESS_HISTORY - 1 - k) % NVMTL_ADDRESS_HISTORY];
+            /* No hash-only equality, and no comparison of physical self pointers: an old table's
+             * self pointers remain valid because its immutable page stays owned by this CB. */
+            if (!memcmp(logical, e->words, NVMTL_NBUF * sizeof(uint64_t)) &&
+                !memcmp(logical + NVMTL_NBUF, e->words + 2 * NVMTL_NBUF, NVMTL_NTEX * sizeof(uint64_t))) {
+                *out = e->info; return 0;
+            }
+        }
+    }
     unsigned slot = c->address_count % NVMTL_TABLES_PER_PAGE;
     nvmtl_address_page *page = c->address_pages;
     if (slot == 0) {
@@ -3924,7 +3968,7 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
         pthread_mutex_lock(&g_pl_lock); nvmtl_pl_made(&g_pl); pthread_mutex_unlock(&g_pl_lock);
     }
     uint64_t *addresses = (uint64_t *)((uint8_t *)page->buffer.map + slot * NVMTL_TABLE_BYTES);
-    nvmtl_bindtable *t = c->table;
+
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) {
         nvmtl_slot *s = t ? &t->s[which][i] : NULL;
         addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : nvmtl_vk_buffer_address(&g_dummyBuf);
@@ -3939,6 +3983,11 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     }
     *out = (VkDescriptorBufferInfo){ page->buffer.buf, slot * NVMTL_TABLE_BYTES, NVMTL_TABLE_BYTES };
     c->address_count++;
+    if (history) {
+        history->e[history->next] = (nvmtl_address_entry){ *out, addresses };
+        history->next = (history->next + 1) % NVMTL_ADDRESS_HISTORY;
+        if (history->count < NVMTL_ADDRESS_HISTORY) history->count++;
+    }
     return 0;
 }
 
@@ -4012,6 +4061,14 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     VkDescriptorSet set = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_POOL_MEMORY;
     const unsigned gl = uniform != NULL;
+    // This list belongs to the recording command buffer, not the shared pools. Grow it before
+    // taking g_desc_lock (or consuming cached sets), so host allocation never serializes encoders.
+    if (c->nsets == c->capsets) {
+        unsigned cap = c->capsets ? c->capsets * 2 : 64;
+        nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
+        if (!grown) { c->skipped++; return VK_NULL_HANDLE; }
+        c->sets = grown; c->capsets = cap;
+    }
     if (c->ndcache && c->dcache_gl_uniform != gl) {
         VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
         for (unsigned k = 0; k < c->ndcache; k++) back[k] = (VkDescriptorSet)c->dcache[k];
@@ -4024,12 +4081,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         set = (VkDescriptorSet)c->dcache[--c->ndcache];
         pool = (VkDescriptorPool)c->dcachepool;
         r = VK_SUCCESS;
-        if (c->nsets == c->capsets) {
-            unsigned cap = c->capsets ? c->capsets * 2 : 64;
-            nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
-            if (grown) { c->sets = grown; c->capsets = cap; }
-            else { c->dcache[c->ndcache++] = (void *)set; c->skipped++; return VK_NULL_HANDLE; }
-        }
+        nvmtl_enc78_count(E78C_DCACHE, 1);
     } else {
         pthread_mutex_lock(&g_desc_lock);
         if (ensure_descriptors_locked()) { pthread_mutex_unlock(&g_desc_lock); c->skipped++; return VK_NULL_HANDLE; }
@@ -4039,40 +4091,38 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         for (unsigned k = 0; k < NVMTL_DESC_BATCH_MAX; k++) ls[k] = gl ? g_glUniformLayout : g_setLayout;
         for (;;) {
             r = VK_ERROR_OUT_OF_POOL_MEMORY;
-            for (unsigned k = g_ndescPools; k-- > 0 && r != VK_SUCCESS;) {
+            for (unsigned k = g_ndescPools; k-- > 0;) {
                 VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[k], n, ls };
                 pool = g_descPools[k]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+                if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) break;
             }
-            if (r != VK_SUCCESS && nvmtl_desc_pool_open() == 0) {
-                VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_descPools[g_ndescPools - 1], n, ls };
-                pool = g_descPools[g_ndescPools - 1]; r = pvkAllocateDescriptorSets(g_dev, &ai, got);
-            }
-            if (r == VK_SUCCESS || n == 1) break;
+            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) break;
+            // A full batch may not fit although individual sets do. Use the tail space before
+            // growing the process-wide pool list; allocation failure leaves no sets to retire.
+            if (n == 1) break;
             n = 1;
+        }
+        if ((r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) && nvmtl_desc_pool_open() == 0) {
+            nvmtl_enc78_count(E78C_POOLOPEN, 1);
+            pool = g_descPools[g_ndescPools - 1];
+            n = nvmtl_desc_batch();
+            for (;;) {
+                VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, pool, n, ls };
+                r = pvkAllocateDescriptorSets(g_dev, &ai, got);
+                if ((r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) || n == 1) break;
+                n = 1;
+            }
         }
         if (r == VK_SUCCESS) {
             set = got[0];
             c->dcachepool = (void *)pool; c->dcache_gl_uniform = gl;
             for (unsigned k = 1; k < n; k++) c->dcache[c->ndcache++] = (void *)got[k];
-        }
-        if (r == VK_SUCCESS && c->nsets == c->capsets) {
-            unsigned cap = c->capsets ? c->capsets * 2 : 64;
-            nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
-            if (grown) { c->sets = grown; c->capsets = cap; }
-            else {
-                pvkFreeDescriptorSets(g_dev, pool, 1, &set);
-                if (c->ndcache) {
-                    VkDescriptorSet back[NVMTL_DESC_BATCH_MAX];
-                    for (unsigned k = 0; k < c->ndcache; k++) back[k] = (VkDescriptorSet)c->dcache[k];
-                    pvkFreeDescriptorSets(g_dev, pool, c->ndcache, back);
-                    c->ndcache = 0; c->dcachepool = NULL;
-                }
-                r = VK_ERROR_OUT_OF_HOST_MEMORY;
-            }
+            nvmtl_enc78_count(E78C_POOLALLOC, 1);
         }
         pthread_mutex_unlock(&g_desc_lock);
     }
     if (r != VK_SUCCESS) {
+        nvmtl_enc78_count(E78C_SETFAIL, 1);
         nvlog("vk: descriptor set allocation FAILED (%d) with %u pools — this draw is SKIPPED, not recorded blind", r, g_ndescPools);
         c->skipped++; return VK_NULL_HANDLE;
     }
@@ -4162,6 +4212,49 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
+/* Only known FS sampled-image/sampler masks, optionally the address table. No direct
+ * buffers, storage descriptors, GL uniforms or mutable texel-buffer interpretations. */
+static nvmtl_descriptor_history *nvmtl_descriptor_history_get(nvk_cmdbuf *c, uint32_t which,
+        const nvk_pipeline *p, const uint64_t *mask)
+{
+    if (nvmtl_snapshot_reuse() != 2 || which != 1 || p->stex_hi[which] || p->gl_uniform_layout || p->tbany
+        || (mask[0] & 0xffffffffull) || (mask[3] & ~1ull)) return NULL;
+    /* The miss path snapshots again in _md; it must find this exact immutable table,
+     * even when allocation of the optional address history failed earlier. */
+    if (!c->address_history) c->address_history = calloc(1, sizeof(nvmtl_address_history));
+    if (!c->address_history) return NULL;
+    if (!c->descriptor_history) c->descriptor_history = calloc(1, sizeof(nvmtl_descriptor_history));
+    return c->descriptor_history;
+}
+static void nvmtl_descriptor_handles(nvk_cmdbuf *c, uint32_t which, const uint64_t *mask, void **handles)
+{
+    nvmtl_bindtable *t = c->table;
+    for (unsigned j = 0; j < NVMTL_NTEX + NVMTL_NSAMP; j++) {
+        unsigned i = NVMTL_NBUF + j; handles[j] = NULL;
+        if (!NVMTL_E78_HAS(mask, i)) continue;
+        const nvmtl_slot *sl = nvmtl_slot_checked(t ? &t->s[which][i] : NULL, which, i);
+        const unsigned kind = j < NVMTL_NTEX ? NVMTL_SLOT_TEX : NVMTL_SLOT_SAMP;
+        if (sl && sl->kind == kind && sl->h) handles[j] = sl->h;
+    }
+}
+static nvmtl_descriptor_entry *nvmtl_descriptor_find(nvk_cmdbuf *c, nvmtl_descriptor_history *h,
+        const uint64_t *mask, void *const *handles, const VkDescriptorBufferInfo *address)
+{
+    for (unsigned k = 0; k < h->count; k++) {
+        nvmtl_descriptor_entry *e = &h->e[(h->next + NVMTL_DESCRIPTOR_HISTORY - 1 - k) % NVMTL_DESCRIPTOR_HISTORY];
+        if (e->idx >= c->nsets || c->sets[e->idx].set != (void *)e->set) continue;
+        int equal = 1;
+        for (unsigned j = 0; j < 4; j++) if (mask[j] & ~e->mask[j]) equal = 0;
+        if (!equal) continue;
+        if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) &&
+            (address->buffer != e->address.buffer || address->range != e->address.range ||
+             (!nvmtl_table_ubo() && address->offset != e->address.offset))) continue;
+        for (unsigned j = 0; j < NVMTL_NTEX + NVMTL_NSAMP; j++)
+            if (NVMTL_E78_HAS(mask, NVMTL_NBUF + j) && handles[j] != e->handles[j]) { equal = 0; break; }
+        if (equal) return e;
+    }
+    return NULL;
+}
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p)
 {
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
@@ -4232,7 +4325,8 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         const int samePage = !table || (t->lasttab[which] && page && (c->address_count % NVMTL_TABLES_PER_PAGE) != 0
                                         && (void *)page->buffer.buf == t->lasttab[which]);
         VkDescriptorBufferInfo ai;
-        if (covered && samePage && (!table || !nvmtl_address_snapshot(c, which, &ai))) {
+        if (covered && samePage && (!table || (!nvmtl_address_snapshot(c, which, &ai)
+                && (void *)ai.buffer == t->lasttab[which]))) {
             if (table) t->lastdyn[which] = (uint32_t)ai.offset;
             t->dirty[which] = 0; memset(t->chg[which], 0, sizeof t->chg[which]);
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
@@ -4253,9 +4347,38 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         }
         for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
     }
-    VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, p->tbany ? tb : NULL, from, from ? cm : NULL, uniform);
-    if (!s) return s;
-    t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
+    nvmtl_descriptor_history *history = nvmtl_descriptor_history_get(c, which, p, m);
+    VkDescriptorBufferInfo ai = {0}; void *handles[NVMTL_NTEX + NVMTL_NSAMP];
+    nvmtl_descriptor_entry *hit = NULL;
+    if (history) {
+        if (NVMTL_E78_HAS(m, NVMTL_ADDRESS_BINDING) && nvmtl_address_snapshot(c, which, &ai)) {
+            c->skipped++; return VK_NULL_HANDLE;
+        }
+        nvmtl_descriptor_handles(c, which, m, handles);
+        hit = nvmtl_descriptor_find(c, history, m, handles, &ai);
+    }
+    VkDescriptorSet s;
+    unsigned idx;
+    if (hit) {
+        s = hit->set; idx = hit->idx;
+        c->dyn_out[which] = nvmtl_table_ubo() ? (uint32_t)ai.offset : 0;
+        c->tab_out[which] = nvmtl_table_ubo() ? (void *)ai.buffer : NULL;
+        nvmtl_enc78_count(E78C_SETREUSE, 1);
+    } else {
+        s = nvmtl_snapshot_set_md(c, which, hi, m, p->tbany ? tb : NULL, from, from ? cm : NULL, uniform);
+        if (!s) return s;
+        idx = c->nsets - 1;
+        /* Publish only fully written, immutable sets. Never update a history entry's set in place. */
+        if (history) {
+            nvmtl_descriptor_entry *e = &history->e[history->next];
+            e->set = s; e->idx = idx; e->address = ai;
+            memcpy(e->mask, m, sizeof e->mask); memcpy(e->handles, handles, sizeof e->handles);
+            history->next = (history->next + 1) % NVMTL_DESCRIPTOR_HISTORY;
+            if (history->count < NVMTL_DESCRIPTOR_HISTORY) history->count++;
+        }
+        nvmtl_enc78_count(E78C_SETNEW, 1);
+    }
+    t->last[which] = s; t->last_idx[which] = idx; t->last_hi[which] = hi; t->dirty[which] = 0;
     memcpy(t->lasttb[which], tb, sizeof notb);
     t->lastgl[which] = p->gl_uniform_layout;
     t->lastubuf[which] = uniform ? uniform->buffer : VK_NULL_HANDLE;
@@ -4263,7 +4386,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     t->lastdyn[which] = c->dyn_out[which]; t->lasttab[which] = c->tab_out[which];
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
-    nvmtl_enc78_count(E78C_SETNEW, 1);
+
     return s;
 }
 
@@ -7807,6 +7930,8 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
     }
     free(c->sets); c->sets = NULL; c->nsets = c->capsets = 0; c->nobind = 0; c->skipped = 0;
     c->fetch_last_set = NULL;   // freed with the sets above
+    free(c->address_history); c->address_history = NULL;
+    free(c->descriptor_history); c->descriptor_history = NULL;
     free(c->table); c->table = NULL;
     nvmtl_address_page *page = c->address_pages;
     const int keep = nvmtl_keep_verdict(c->wseq);
@@ -10194,6 +10319,43 @@ int nvmtl_vk_buffer_create_placed(size_t size, nvk_heap *heap, size_t offset, nv
     return 0;
 }
 
+/* Physical-device format answers never change for the life of the device, but the buffer-alias path (every IOSurface
+   texture WindowServer wraps) asked for them on every image: the format, each same-size view format, then a mutable-image
+   query. They are answered once here. Entries are filled under a lock and read after an acquire of their ready flag. */
+#include <os/lock.h>
+static os_unfair_lock g_fmtmemo_lock = OS_UNFAIR_LOCK_INIT;
+static VkFormatProperties g_fmtmemo[256];
+static _Atomic unsigned char g_fmtmemo_ready[256];
+static void nvmtl_vk_fmt_props(PFN_vkGetPhysicalDeviceFormatProperties gfp, VkFormat f, VkFormatProperties *o)
+{
+    memset(o, 0, sizeof *o);
+    if ((uint32_t)f < 256 && atomic_load_explicit(&g_fmtmemo_ready[f], memory_order_acquire)) { *o = g_fmtmemo[f]; return; }
+    if (!gfp) return;
+    gfp(g_pdev, f, o);
+    if ((uint32_t)f < 256) {
+        os_unfair_lock_lock(&g_fmtmemo_lock);
+        if (!atomic_load_explicit(&g_fmtmemo_ready[f], memory_order_relaxed)) { g_fmtmemo[f] = *o; atomic_store_explicit(&g_fmtmemo_ready[f], 1, memory_order_release); }
+        os_unfair_lock_unlock(&g_fmtmemo_lock);
+    }
+}
+typedef struct { uint32_t fmt, usage, vmask; int linmod; VkResult r; } nvmtl_mutq_memo;
+static nvmtl_mutq_memo g_mutq[32];
+static unsigned g_mutq_n;
+static int nvmtl_vk_mutq_lookup(uint32_t fmt, uint32_t usage, uint32_t vmask, VkResult *r)
+{
+    int hit = 0;
+    os_unfair_lock_lock(&g_fmtmemo_lock);
+    for (unsigned i = 0; i < g_mutq_n && !hit; i++)
+        if (g_mutq[i].fmt == fmt && g_mutq[i].usage == usage && g_mutq[i].vmask == vmask && g_mutq[i].linmod == g_linmod) { *r = g_mutq[i].r; hit = 1; }
+    os_unfair_lock_unlock(&g_fmtmemo_lock);
+    return hit;
+}
+static void nvmtl_vk_mutq_store(uint32_t fmt, uint32_t usage, uint32_t vmask, VkResult r)
+{
+    os_unfair_lock_lock(&g_fmtmemo_lock);
+    if (g_mutq_n < sizeof g_mutq / sizeof *g_mutq) g_mutq[g_mutq_n++] = (nvmtl_mutq_memo){ fmt, usage, vmask, g_linmod, r };
+    os_unfair_lock_unlock(&g_fmtmemo_lock);
+}
 static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
                                        const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
 int nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
@@ -10218,9 +10380,9 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
     if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > b->size - offset) {
         nvlog("buffer texture: %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
-    PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
-    VkFormatProperties fp; memset(&fp, 0, sizeof fp);
-    if (gfp) gfp(g_pdev, (VkFormat)vkfmt, &fp);
+    static PFN_vkGetPhysicalDeviceFormatProperties gfp;
+    if (!gfp) gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
+    VkFormatProperties fp; nvmtl_vk_fmt_props(gfp, (VkFormat)vkfmt, &fp);
     VkFormatFeatureFlags lf = fp.linearTilingFeatures;
     if (!(lf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { nvlog("buffer texture: VkFormat %u cannot be sampled LINEAR (features 0x%x)", vkfmt, (unsigned)lf); return -1; }
     int wantS = storage, wantR = render;
@@ -10252,8 +10414,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         const VkFormatFeatureFlags need = nvmtl_vk_usage_features(ici.usage);
         int self_listed = 0;
         for (uint32_t i = 0; i < vtbln && nlist < (uint32_t)(sizeof vlist / sizeof *vlist); i++) {
-            VkFormatProperties pp; memset(&pp, 0, sizeof pp);
-            if (gfp) gfp(g_pdev, vtbl[i], &pp);
+            VkFormatProperties pp; nvmtl_vk_fmt_props(gfp, vtbl[i], &pp);
             if ((pp.linearTilingFeatures & need) != need) continue;
             if ((uint32_t)vtbl[i] == vkfmt) self_listed = 1;
             vlist[nlist++] = vtbl[i];
@@ -10277,7 +10438,11 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         VkPhysicalDeviceImageFormatInfo2 qi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, g_linmod ? (void *)&qmi : (void *)&qfl,
             ici.format, ici.imageType, ici.tiling, ici.usage, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT };
         VkImageFormatProperties2 qo; memset(&qo, 0, sizeof qo); qo.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
-        VkResult qr = gif ? gif(g_pdev, &qi, &qo) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkResult qr;
+        if (!nvmtl_vk_mutq_lookup(vkfmt, (uint32_t)ici.usage, vmask, &qr)) {
+            qr = gif ? gif(g_pdev, &qi, &qo) : VK_ERROR_EXTENSION_NOT_PRESENT;
+            if (gif && (qr == VK_SUCCESS || qr == VK_ERROR_FORMAT_NOT_SUPPORTED)) nvmtl_vk_mutq_store(vkfmt, (uint32_t)ici.usage, vmask, qr);
+        }
         if (qr == VK_SUCCESS) { ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; fl.viewFormatCount = nlist; ici.pNext = &fl; }
         else { nvlog("buffer texture: VkFormat %u stays single-format - a mutable image over its %u same-size format(s) is refused (VkResult %d%s)",
                      vkfmt, nlist, (int)qr, gif ? "" : ", no vkGetPhysicalDeviceImageFormatProperties2"); vmask = 0; nlist = 0; }

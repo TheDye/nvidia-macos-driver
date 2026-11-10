@@ -130,7 +130,7 @@ static NSUInteger nvmtl_ss_enum(NSDictionary *st, NSString *key, NSDictionary<NS
     if (!n) { *bad = YES; nvlog("static sampler: %s = %s has no Metal equivalent here", key.UTF8String, [v UTF8String]); return fallback; }
     return n.unsignedIntegerValue;
 }
-static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
+static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st, id<MTLDevice> device)
 {
     NSDictionary *filt = @{ @"Nearest": @(MTLSamplerMinMagFilterNearest), @"Linear": @(MTLSamplerMinMagFilterLinear) };
     NSDictionary *mip = @{ @"None": @(MTLSamplerMipFilterNotMipmapped), @"Nearest": @(MTLSamplerMipFilterNearest),
@@ -161,9 +161,12 @@ static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
     if ([lo isKindOfClass:[NSNumber class]]) d.lodMinClamp = lo.floatValue;
     if ([hi isKindOfClass:[NSNumber class]]) d.lodMaxClamp = hi.floatValue;
     if (bad) return nil;
-    return [MTLCreateSystemDefaultDevice() newSamplerStateWithDescriptor:d];
+    // The shader's own device (upstream PR #530): the system default device can be another GPU (an AMD iGPU under
+    // NootedRed), whose sampler NVK then cannot read, and asking for it is a WindowServer round trip per dispatch.
+    return [device newSamplerStateWithDescriptor:d];
 }
 static const void *NVMTL_SSAMP_KEY = &NVMTL_SSAMP_KEY;
+NSDictionary *nvmtl_reflection_parse(NSData *d);
 static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
 {
     NSArray *cached = objc_getAssociatedObject(fn, NVMTL_SSAMP_KEY);
@@ -175,13 +178,13 @@ static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
         char e[512] = { 0 };
         NSData *d = (fn->_air && fn->_stage.length && nvmtl_xlate_ready() && xlate_refl)
                   ? nvmtl_reflect_air_cached(fn, fn->_air, fn->_stage, e, sizeof e) : nil;
-        NSDictionary *refl = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
+        NSDictionary *refl = d ? nvmtl_reflection_parse(d) : nil;
         NSArray *all = [refl isKindOfClass:[NSDictionary class]] ? refl[@"bindings"] : nil;
         for (NSDictionary *b in [all isKindOfClass:[NSArray class]] ? all : @[]) {
             if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"StaticSampler"]) continue;
             NSNumber *slot = b[@"metal_index"]; NSDictionary *st = b[@"static_sampler"];
             if (![slot isKindOfClass:[NSNumber class]] || ![st isKindOfClass:[NSDictionary class]]) continue;
-            id<MTLSamplerState> s = nvmtl_static_sampler_from(st);
+            id<MTLSamplerState> s = nvmtl_static_sampler_from(st, [fn device]);
             if (s) [out addObject:@[slot, s]];
             else nvlog("static sampler: %s slot %@ NOT created - it keeps the dummy sampler", fn->_fname.UTF8String, slot);
         }

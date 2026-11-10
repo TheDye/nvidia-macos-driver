@@ -9210,7 +9210,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvRmSemSurf.h b/src/nouveau/vulkan/nvk
 diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h	1969-12-31 16:00:00
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h	2026-10-28 22:05:51
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,309 @@
 +/*
 + * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
 + * SPDX-License-Identifier: MIT
@@ -9460,6 +9460,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkm
 +bool nvkmd_nvrm_diag_on(void);                                   /* r3-diag: NVK_DIAG=1 in nvrm610.conf */
 +void nvkmd_nvrm_diag_dump(const char *why, const char *heads);   /* r3-diag: every channel's state */
 +void nvkmd_nvrm_gsub_stats(uint64_t *out, unsigned n);   /* exported: the plugin's census reads it via dlsym */
++void nvkmd_nvrm_wait_stats(uint64_t *out, unsigned n);   /* exported: event sleeps, backoff sleeps, short spins */
 +long nvkmd_nvrm_flush_timeout_ms(void);
 +void nvkmd_nvrm_gsub_count(unsigned which);
 +bool nvkmd_nvrm_seq_done(uint32_t slot, uint32_t gen, uint64_t seq);   /* caller holds nvkmd_nvrm_gsub_mtx */
@@ -9522,7 +9523,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkm
 diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	1969-12-31 16:00:00
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	2026-10-29 17:38:59
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,1450 @@
 +/*
 + * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
 + * SPDX-License-Identifier: MIT
@@ -9705,18 +9706,30 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +             : i - 1 < NVRM_GS_N ? __atomic_load_n(&nvrm_gsub_stats[i - 1], __ATOMIC_RELAXED) : 0;
 +}
 +
-+/* The synchronous flush's back-off (batch 27, measured): pause-spin to 50 us, sched_yield to 1 ms, usleep(50) to
-+ * 20 ms, then usleep(200).  The old tail also polled osEvent, a dup of /dev/null that returns at once on macOS. */
++/* Process-wide cumulative attempts: event sleeps, backoff sleeps, short spins. */
++static uint64_t nvrm_wait_stats[3];
++__attribute__((visibility("default"))) void
++nvkmd_nvrm_wait_stats(uint64_t *out, unsigned n)
++{
++   for (unsigned i = 0; i < n; i++)
++      out[i] = i < 3 ? __atomic_load_n(&nvrm_wait_stats[i], __ATOMIC_RELAXED) : 0;
++}
++
++/* Briefly spin for short completions, then really sleep: sched_yield can return
++ * immediately on macOS and burn a core through every sub-millisecond wait.
++ * Keep each requested sleep bounded (50 us to 20 ms, then 200 us) so callers
++ * continue to recheck completion, faults and deadlines. */
 +void
 +nvkmd_nvrm_wait_backoff(int64_t waited_ns)
 +{
-+   if (waited_ns < 50000) {
++   if (waited_ns < 20000) {
++      __atomic_fetch_add(&nvrm_wait_stats[2], 1, __ATOMIC_RELAXED);
 +#if defined(__x86_64__)
 +      for (int s = 0; s < 64; s++) __builtin_ia32_pause();
 +#endif
 +      return;
 +   }
-+   if (waited_ns < 1000000) { sched_yield(); return; }
++   __atomic_fetch_add(&nvrm_wait_stats[1], 1, __ATOMIC_RELAXED);
 +   if (waited_ns < 20000000) { usleep(50); return; }
 +   usleep(200);
 +}
@@ -9777,6 +9790,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +   { static int said; if (!said++) fprintf(stderr, "nvrm: b73 event wait ON - waits sleep on graphics completion events (fd %d)\n", fd); }
 +   if (!nvrm_evwait_pending(n, slot, gen, want, &fd) || fd < 0)
 +      return;
++   __atomic_fetch_add(&nvrm_wait_stats[0], 1, __ATOMIC_RELAXED);
 +   (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
 +}
 +
@@ -9801,6 +9815,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +   if (__atomic_load_n(sem, __ATOMIC_ACQUIRE) >= want)
 +      return true;
 +   { static int said; if (!said++) fprintf(stderr, "nvrm: b73 flush waits sleep on the device's graphics event (fd %d)\n", fd); }
++   __atomic_fetch_add(&nvrm_wait_stats[0], 1, __ATOMIC_RELAXED);
 +   (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
 +   return true;
 +}
@@ -10767,29 +10782,13 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +         fprintf(stderr, "nvrm: NO channel fault was reported in %ld ms (error notifier status 0x%x, unchanged since submit). The GPU was still working; this DEADLINE is the only reason the device is being called lost. Raise NVRM_FLUSH_TIMEOUT_MS if the work is legitimate.\n", ms, baseStatus);
 +         return vk_errorf(log_obj, VK_ERROR_DEVICE_LOST, "NVRM channel did not complete within NVRM_FLUSH_TIMEOUT_MS");
 +      }
-+      // batch 27  — THE WAIT WAS THE SLEEP, NOT THE GPU. A warm Vision optical-flow run spent 5.68 s
-+      // of 13.2 s inside the usleep below (sample, 1 ms interval), and poll+usleep(200) measured 445 us MEDIAN per
-+      // iteration on the test machine (500 trials) — so every flush paid >= 0.445 ms whether the GPU took 20 us or 20 ms.
-+      // Tiered by time since submit: pause-spin 50 us, sched_yield to 1 ms, usleep(50) (79 us measured) to 20 ms,
-+      // then the old poll+usleep(200). The semaphore, fault and deadline checks above still run EVERY iteration.
-+      // CPU bound: at most ~1 ms of yielding per flush; a long dispatch costs what it cost before.
-+      {
-+         long waitedUs = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
-+         if (waitedUs < 20) {
-+#if defined(__x86_64__)
-+            for (int s = 0; s < 64; s++) __builtin_ia32_pause();
-+#endif
-+            continue;
-+         }
-+         // b73: sleep on the device's graphics completion event (kext selector 6) instead of polling
-+         if (nvrm_flush_sleep(ctx, semAdr, ctx->wSeq))
-+            continue;
-+         if (waitedUs < 1000) { sched_yield(); continue; }
-+         if (waitedUs < 20000) { usleep(50); continue; }
-+      }
-+      // b73: WAS poll on ctx->osEvent (a /dev/null dup that returned at once); with no per-channel event the fd
-+      // is -1 and poll would sleep its whole 1000 ms timeout. The plain backoff only.
-+		usleep(200);
++      // Preserve the event protocol and its initial 20 us spin. With no usable
++      // event, use the same bounded sleeping backoff as asynchronous waits.
++      const int64_t waited_ns = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
++                                t1.tv_nsec - t0.tv_nsec;
++      if (waited_ns >= 20000 && nvrm_flush_sleep(ctx, semAdr, ctx->wSeq))
++         continue;
++      nvkmd_nvrm_wait_backoff(waited_ns);
 +#if 0
 +		printf("poll\n");
 +      fprintf(stderr, "rSeq: %#" PRIx64 "\n", rSeq);

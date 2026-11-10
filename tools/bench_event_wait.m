@@ -3,6 +3,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <sys/resource.h>
@@ -42,9 +44,13 @@ static NSDictionary *transfer(id<MTLDevice> d,id<MTLCommandQueue> q,NSString *na
 }
 int main(int argc,char **argv){@autoreleasepool{
     NSString *mode=argc>1?@(argv[1]):@"inventory";
+    if(getenv("NM_TEST_PLUGIN")&&[mode isEqual:@"image"])
+        fail(@"Core Image discovers the installed bundle; use the installed plugin with NM_TEST_ICD for image tests");
     // Load the installed plugin first: release builds clear inherited tuning variables.
     // Overrides below exist only in this disposable probe, before device initialization.
-    void *plugin=dlopen("/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver",RTLD_NOW|RTLD_GLOBAL);
+    const char *pluginPath=getenv("NM_TEST_PLUGIN");
+    if(!pluginPath)pluginPath="/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver";
+    void *plugin=dlopen(pluginPath,RTLD_NOW|RTLD_GLOBAL);
     if(!plugin)fail(@(dlerror()));
     NSMutableDictionary *overrides=[NSMutableDictionary dictionary];
     for(int i=2;i<argc;i++){
@@ -53,13 +59,26 @@ int main(int argc,char **argv){@autoreleasepool{
         if(![k isEqualToString:@"NVRM_EVENT_WAIT"] || (strcmp(eq+1,"0") && strcmp(eq+1,"1")))fail(@"expected NVRM_EVENT_WAIT=0 or NVRM_EVENT_WAIT=1");
         setenv(k.UTF8String,eq+1,1);overrides[k]=@(eq+1);
     }
-    double init=now();id<MTLDevice> d=MTLCreateSystemDefaultDevice();
+    const char *icdPath=getenv("NM_TEST_ICD");
+    if(icdPath)setenv("NVMTL_ICD_LIB",icdPath,1);
+    double init=now();id<MTLDevice> d=nil;
+    if(getenv("NM_TEST_PLUGIN")){
+        // Explicit candidates must not trigger Metal's discovery of the installed bundle too.
+        io_service_t svc=IOServiceGetMatchingService(kIOMainPortDefault,IOServiceMatching("NVAccel"));
+        if(!svc)fail(@"no NVAccel service");
+        d=((id(*)(id,SEL,mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],NSSelectorFromString(@"initWithAcceleratorPort:"),svc);
+        IOObjectRelease(svc);
+    }else d=MTLCreateSystemDefaultDevice();
     if(!d)fail(@"no Metal device");
     NSMutableDictionary *result=[@{@"device":d.name,@"initialization_ms":@((now()-init)*1000),@"mode":mode,@"overrides":overrides,@"recommended_working_set_bytes":@(d.recommendedMaxWorkingSetSize)} mutableCopy];
     result[@"plugin_image"]=@(class_getImageName(object_getClass(d)));
-    if(![result[@"plugin_image"] isEqualToString:@"/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver"])
-        fail(@"the default Metal device is not the installed NVMTL device");
-    result[@"probe_version"]=@2;
+    if(![result[@"plugin_image"] isEqualToString:@(pluginPath)])
+        fail(@"the default Metal device is not the requested NVMTL device");
+    void *icd=dlopen(icdPath?:"/Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib",RTLD_LAZY|RTLD_NOLOAD);
+    if(icdPath&&!icd)fail(@"requested ICD is not mapped (check release ownership policy)");
+    void (*waitStats)(uint64_t *,unsigned)=icd?dlsym(icd,"nvkmd_nvrm_wait_stats"):NULL;
+    uint64_t waitsBefore[3]={0}; if(waitStats)waitStats(waitsBefore,3);
+    result[@"probe_version"]=@3;
     if([mode isEqual:@"inventory"]){
         CGDirectDisplayID display=CGMainDisplayID();CGDisplayModeRef current=CGDisplayCopyDisplayMode(display);
         result[@"display"]=@{@"width":@(CGDisplayModeGetWidth(current)),@"height":@(CGDisplayModeGetHeight(current)),@"pixel_width":@(CGDisplayModeGetPixelWidth(current)),@"pixel_height":@(CGDisplayModeGetPixelHeight(current)),@"hz":@(CGDisplayModeGetRefreshRate(current))};CGDisplayModeRelease(current);
@@ -125,6 +144,10 @@ int main(int argc,char **argv){@autoreleasepool{
         result[@"median_cpu_ms"]=@(median(cpuTimes));result[@"samples_cpu_ms"]=cpuTimes;
         CGColorSpaceRelease(cs);
     }else fail(@"unknown probe mode");
+    if(waitStats){
+        uint64_t after[3]={0};waitStats(after,3);
+        result[@"wait_stats"]=@{@"event_calls":@(after[0]-waitsBefore[0]),@"fallback_sleeps":@(after[1]-waitsBefore[1]),@"spin_calls":@(after[2]-waitsBefore[2])};
+    }
     NSError *jsonError=nil;NSData*json=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:&jsonError];
     if(!json)fail(jsonError.description);fwrite(json.bytes,1,json.length,stdout);fputc('\n',stdout);
 }}

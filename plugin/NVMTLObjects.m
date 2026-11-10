@@ -1125,18 +1125,14 @@ uint32_t nvmtl_function_spv_fnv(id f)
 }
 // The first 8 bytes of the sha256 of a function's AIR text, as the pipeline key line prints them: the module key a
 // profile row or a fault-context dispatch is joined to. Computed once per function.
+uint64_t nvmtl_air_text_key(NSString *ll);
 uint64_t nvmtl_function_air_key(id f)
 {
     if (![f isKindOfClass:[NVMTLFunction class]]) return 0;
     NVMTLFunction *fn = f; static char kKey;
     NSNumber *h = objc_getAssociatedObject(fn, &kKey);
     if (h) return h.unsignedLongLongValue;
-    uint64_t v = 0;
-    if (fn->_air.length) {
-        const char *s = fn->_air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(s, (CC_LONG)strlen(s), dg);
-        for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
-    }
+    const uint64_t v = nvmtl_air_text_key(fn->_air);
     objc_setAssociatedObject(fn, &kKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return v;
 }
@@ -1451,7 +1447,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
     if (!_parent) { nvmtl_vk_image_dying_label(_label.UTF8String); nvmtl_vk_image_destroy(&_i); }
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
-    if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+    if (!_parent && _vramOn) { nvmtl_surface_vram_put(&_vramBuf); _vramOn = NO; }
     if (!_parent) nvmtl_vk_host_pages_drop(&_hostPages);
     if (_surfOwned && _surf) CFRelease(_surf);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
@@ -2897,9 +2893,13 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv
           completionHandler:(void (^)(id<MTLFunction>, NSError *))handler {
     if (!handler) return;
-    NSError *err = nil;
-    id<MTLFunction> f = [self newFunctionWithName:name constantValues:cv error:&err];
-    handler(f, err);
+    NSString *functionName = [name copy];
+    MTLFunctionConstantValues *values = [cv copy];
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        NSError *err = nil;
+        id<MTLFunction> f = [self newFunctionWithName:functionName constantValues:values error:&err];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ handler(f, err); });
+    }}];
 }
 - (id<MTLFunction>)newFunctionWithDescriptor:(id)desc error:(NSError **)error {
     if (error) *error = nil;
@@ -2932,9 +2932,12 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
 }
 - (void)newFunctionWithDescriptor:(id)desc completionHandler:(void (^)(id<MTLFunction>, NSError *))handler {
     if (!handler) return;
-    NSError *err = nil;
-    id<MTLFunction> f = [self newFunctionWithDescriptor:desc error:&err];
-    handler(f, err);
+    id snapshot = [desc copy];
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        NSError *err = nil;
+        id<MTLFunction> f = [self newFunctionWithDescriptor:snapshot error:&err];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ handler(f, err); });
+    }}];
 }
 - (NSArray<NSString *> *)externFunctionNames {
     NSSet<NSString *> *x = nvmtl_mtlb_extern_names(_raw);
@@ -3565,6 +3568,7 @@ static nvk_cmdbuf *nvmtl_hz_blit_open(NVMTLCommandBuffer *cb, id src, id dst) {
     return c;
 }
 #define NVMTL_HZ_BLIT(src, dst) __attribute__((cleanup(nvmtl_hz_blit_close))) nvk_cmdbuf *hzblit_ = nvmtl_hz_blit_open(_cb, (id)(src), (id)(dst)); (void)hzblit_
+static void nvmtl_enc78_census(void);   // defined with the compute encoder's counters below
 @implementation NVMTLRenderCommandEncoder
 // NVMTL_HAZARD: end the pass, take a full barrier and begin it again with every attachment loaded (as a pipeline with
 // fewer attachments does). forceFull: this encoder keeps render passes from here on.
@@ -3643,6 +3647,37 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     for (NSString *k in m) { NSMutableDictionary *st = [m[k] mutableCopy]; st[@"lod_max_clamp"] = @65504.0f; o[k] = st; }
     return o;
 }
+// Sampler-state dictionaries (including LOD overrides) use decimal NSString keys.
+static NSString *nvmtl_sampler_index_key(NSUInteger i) {
+    static NSString *const keys[16] = {
+        @"0", @"1", @"2", @"3", @"4", @"5", @"6", @"7",
+        @"8", @"9", @"10", @"11", @"12", @"13", @"14", @"15"
+    };
+    return i < 16 ? keys[i] : [@(i) stringValue];
+}
+
+// Diagnostics only: fixed storage, no per-bind objects, and no eviction/relogging at capacity.
+static BOOL nvmtl_texture_shape_first(NSUInteger fmt, NSUInteger usage, NSUInteger type) {
+    static struct { NSUInteger fmt, usage, type; } seen[128];
+    static NSUInteger count;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lock);
+    for (NSUInteger i = 0; i < count; i++) {
+        if (seen[i].fmt == fmt && seen[i].usage == usage && seen[i].type == type) {
+            os_unfair_lock_unlock(&lock);
+            return NO;
+        }
+    }
+    if (count == sizeof seen / sizeof seen[0]) {
+        os_unfair_lock_unlock(&lock);
+        return NO;
+    }
+    seen[count].fmt = fmt; seen[count].usage = usage; seen[count].type = type;
+    count++;
+    os_unfair_lock_unlock(&lock);
+    return YES;
+}
+
 static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *index, NSDictionary *state) {
     NSDictionary *old = states[index];
     if (old == state || [old isEqual:state]) return NO;
@@ -4092,7 +4127,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         nvlog("setFragmentSamplerState: invalid index or bind failure"); return;
     }
     if (!_fragmentSamplers) _fragmentSamplers=[NSMutableDictionary new];
-    NSString *key=[@(i) stringValue];
+    NSString *key=nvmtl_sampler_index_key(i);
     if (nvmtl_pixel_sampler_update(_fragmentSamplers,key,ns ? ns->_pixelState : nil)) _pixelSamplerKey=nil;
     nvtrace("FRAGMENT SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
     if(ns) { if (!_cb->_resources) _cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:ns]; }
@@ -4103,7 +4138,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
         nvlog("setVertexSamplerState: invalid index or bind failure"); return;
     }
     if (!_vertexSamplers) _vertexSamplers=[NSMutableDictionary new];
-    NSString *key=[@(i) stringValue];
+    NSString *key=nvmtl_sampler_index_key(i);
     if (nvmtl_pixel_sampler_update(_vertexSamplers,key,ns ? ns->_pixelState : nil)) _pixelSamplerKey=nil;
     nvtrace("VERTEX SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
     if(ns) { if (!_cb->_resources) _cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:ns]; }
@@ -4122,9 +4157,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     nvmtl_hz_bind_storage(&_cb->_c, [nt nvi], nvmtl_hz_untracked_tex(nt), NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_stex ? [nt nvview] : NULL);
     if (!nt->_stex && (nt.usage & MTLTextureUsageShaderWrite)) {
         // a fragment shader writing a texture that has no storage view writes the dummy: say which texture, once per shape
-        static NSMutableSet *seen; static os_unfair_lock sl = OS_UNFAIR_LOCK_INIT;
-        NSString *k = [NSString stringWithFormat:@"%lu/%lu/%lu", (unsigned long)nt.pixelFormat, (unsigned long)nt.usage, (unsigned long)nt.textureType];
-        os_unfair_lock_lock(&sl); if (!seen) seen = [NSMutableSet new]; BOOL fresh = ![seen containsObject:k]; if (fresh) [seen addObject:k]; os_unfair_lock_unlock(&sl);
+        BOOL fresh = nvmtl_texture_shape_first(nt.pixelFormat, nt.usage, nt.textureType);
         if (fresh) nvlog("setFragmentTexture: texture %lu is ShaderWrite but has no storage view (pixelFormat %lu, usage 0x%lx, type %lu, image storage %u) - a fragment write to it goes to the dummy",
                          (unsigned long)i, (unsigned long)nt.pixelFormat, (unsigned long)nt.usage, (unsigned long)nt.textureType, [nt nvi]->storage);
     }
@@ -4261,6 +4294,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)endEncoding {
     _cb->_nEnd++;
+    nvmtl_enc78_census();   // off unless NVMTL_ENC78_CENSUS or /Library/GPUBundles/nvmtl-census; WindowServer composites here
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
@@ -4483,7 +4517,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setFragmentSamplerState:ss atIndex:i];
-    NSString *key=[@(i) stringValue];
+    NSString *key=nvmtl_sampler_index_key(i);
     if(_fragmentSamplers[key]) {
         NSMutableDictionary *state=[_fragmentSamplers[key] mutableCopy];
         state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);
@@ -4492,7 +4526,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setVertexSamplerState:ss atIndex:i];
-    NSString *key=[@(i) stringValue];
+    NSString *key=nvmtl_sampler_index_key(i);
     if(_vertexSamplers[key]) {
         NSMutableDictionary *state=[_vertexSamplers[key] mutableCopy];
         state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);
@@ -5233,7 +5267,10 @@ static NSUInteger nvmtl_compute_maxt(void) { static NSUInteger v; if (!v) v = nv
 
 enum { NVMTL_E78_H3 = 1, NVMTL_E78_H4 = 2, NVMTL_E78_H5 = 4, NVMTL_E78_P1 = 8, NVMTL_E78_H7 = 16 };
 enum { E78C_ENC, E78C_DISP, E78C_FULL, E78C_NARROW, E78C_NONE, E78C_ENDFULL, E78C_SETNEW, E78C_SETREUSE, E78C_WRITES,
-       E78C_RING, E78C_RINGBYTES, E78C_RINGCHUNK, E78C_BYTESOLD, E78C_VARHIT, E78C_VARMISS, E78C_CONC, E78C_N };
+       E78C_RING, E78C_RINGBYTES, E78C_RINGCHUNK, E78C_BYTESOLD, E78C_VARHIT, E78C_VARMISS, E78C_CONC,
+       // New descriptor sets by source: the command buffer's batch cache, a locked pool allocation (one per batch),
+       // a newly opened pool, or a failure (the draw was skipped). setnew = dcache + poolalloc-batches' first sets.
+       E78C_DCACHE, E78C_POOLALLOC, E78C_POOLOPEN, E78C_SETFAIL, E78C_N };
 static uint64_t g_e78c[E78C_N];
 static int g_e78_off = -1, g_e78_census = -1;
 static int nvmtl_enc78_on(int row) {
@@ -5255,15 +5292,26 @@ static int nvmtl_enc78_on(int row) {
 }
 static void nvmtl_enc78_count(int k, uint64_t n) { if (k >= 0 && k < E78C_N) __atomic_fetch_add(&g_e78c[k], n, __ATOMIC_RELAXED); }
 static void nvmtl_enc78_census(void) {
-    if (g_e78_census < 0) { const char *e = getenv("NVMTL_ENC78_CENSUS"); g_e78_census = e ? atoi(e) : 0; }
+    // NVMTL_ENC78_CENSUS=1 (powers of two) or 2 (every encoder). WindowServer gets no environment from the user, so a
+    // root-owned flag file turns mode 1 on there too: sudo touch /Library/GPUBundles/nvmtl-census, then restart it.
+    if (g_e78_census < 0) {
+        const char *e = getenv("NVMTL_ENC78_CENSUS");
+        g_e78_census = e ? atoi(e) : (access("/Library/GPUBundles/nvmtl-census", F_OK) == 0 ? 1 : 0);
+    }
     uint64_t n = __atomic_add_fetch(&g_e78c[E78C_ENC], 1, __ATOMIC_RELAXED);
     if (!g_e78_census || (g_e78_census < 2 && (n & (n - 1)))) return;
     uint64_t v[E78C_N]; for (int k = 0; k < E78C_N; k++) v[k] = __atomic_load_n(&g_e78c[k], __ATOMIC_RELAXED);
-    fprintf(stderr, "ENC78 enc %llu disp %llu full %llu narrow %llu none %llu endfull %llu setnew %llu setreuse %llu writes %llu "
-            "ring %llu ringbytes %llu ringchunk %llu bytesold %llu varhit %llu varmiss %llu conc %llu rowsoff 0x%x\n",
+    char line[512];
+    snprintf(line, sizeof line, "ENC78 enc %llu disp %llu full %llu narrow %llu none %llu endfull %llu setnew %llu setreuse %llu writes %llu "
+            "ring %llu ringbytes %llu ringchunk %llu bytesold %llu varhit %llu varmiss %llu conc %llu rowsoff 0x%x "
+            "dcache %llu poolalloc %llu poolopen %llu setfail %llu",
             v[E78C_ENC], v[E78C_DISP], v[E78C_FULL], v[E78C_NARROW], v[E78C_NONE], v[E78C_ENDFULL], v[E78C_SETNEW],
             v[E78C_SETREUSE], v[E78C_WRITES], v[E78C_RING], v[E78C_RINGBYTES], v[E78C_RINGCHUNK], v[E78C_BYTESOLD],
-            v[E78C_VARHIT], v[E78C_VARMISS], v[E78C_CONC], g_e78_off < 0 ? 0 : g_e78_off);
+            v[E78C_VARHIT], v[E78C_VARMISS], v[E78C_CONC], g_e78_off < 0 ? 0 : g_e78_off,
+            v[E78C_DCACHE], v[E78C_POOLALLOC], v[E78C_POOLOPEN], v[E78C_SETFAIL]);
+    fprintf(stderr, "%s\n", line);
+    // stderr is invisible for WindowServer; tools/ws_frame_cost.sh reads this from the unified log.
+    syslog(LOG_NOTICE, "NullMoth: %s (%s)", line, getprogname());
 }
 void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c);
 @interface NVMTLCommandBuffer () { @public NVMTLBuffer *_e78Ring; size_t _e78RingOff; } @end

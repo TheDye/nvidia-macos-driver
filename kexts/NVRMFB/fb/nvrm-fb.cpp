@@ -482,7 +482,15 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     static inline volatile SInt32 sFlipLatched[8] = {};
-    bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
+    // Private handoff only: the platform ABI still returns synchronously after landing. All fields are display-gated.
+    struct NVFlipToken { uint64_t epoch = 0, sequence = 0, submitAbs = 0, boundUs = 0; };
+    uint64_t fLandingEpoch = 1, fSubmitted = 0, fCompleted = 0;
+    struct NvKmsKapiDevice *fSubmissionDevice = nullptr;
+    bool fFlipPowerInvalid = false, fLandingOwed = false;
+    void invalidateLanding();
+    bool waitLandedUngated(const NVFlipToken &token);
+    bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0,
+                      NVFlipToken *defer = nullptr);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
     // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
     // stuck (kFlipStuckUs since its submit, the head is faulted).
@@ -496,7 +504,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint64_t fEnableAbs = 0;    // when enableController ran, for the first-primary-flip timing line
     bool fFirstPrimaryLogged = false;   // a login screen that never gets one is the black-screen-with-cursor signature
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false, bool frame = false);
+                        bool bootstrap = false, bool cursorOnly = false, bool frame = false, NVFlipToken *defer = nullptr);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -1762,9 +1770,18 @@ bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
     if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
     uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
     for (;;) {
+        // Every caller holds the display gate, including the zero-duration ungated poll below.
+        if (OSAddAtomic(0, &fStopping) || fSubmissionFaulted || fFlipPowerInvalid || !fKms || !fDev ||
+            (fSubmissionDevice && fSubmissionDevice != fDev)) return false;
         NvBool pending = NV_TRUE;
         if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
-        if (!pending) return true;
+        if (!pending) {
+            // Publish BEFORE any later primary submit can advance/reset the live notifier. There can be no hole:
+            // submitConfig proves the previous primary complete before accepting the next one.
+            if (fSubmissionSeen) fCompleted = fSubmitted;
+            if (fCompleted == fSubmitted) fLandingOwed = false;
+            return true;
+        }
         uint64_t now = mach_absolute_time();
         if (now >= end) return false;
         uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
@@ -1780,6 +1797,12 @@ bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
 // its flip latches, i.e. reintroduces the strobe). The counters report the real wait the compositor
 // path takes, which is what an on-machine flicker check reads.
 static int gFlipLatch = 1;
+// Default ON after mixed-head hardware validation (RTX 4060 Ti, 165 Hz + 60 Hz, macOS 26.7.2, 2026-11-09): with a window
+// animating on the 165 Hz head the gated wait held the display gate for ~6.5 ms per flip and that head reached 89-92 flips/s;
+// the landing wait outside the gate gave 136-138 flips/s, a 182 us flip call, 0 late, 0 timeouts, 0 failures, the 60 Hz head
+// unchanged at 60/s. The landing is still awaited before the surface retires. sudo sysctl debug.nvrmfb_flip_ungated=0 restores
+// the gated wait until reboot.
+static int gFlipUngated = 1;
 static int gFlipLatchWaits = 0, gFlipLatchTimeouts = 0, gFlipLatchMaxUs = 0, gFlipLatchLate = 0;
 // gFlipLatch == 2 (opt in): priorFlipState() at the head of the next submit verifies the flip instead of this submit
 // waiting for it. The wait costs half a refresh period on the present path (2.08 ms of a 4.17 ms 240 Hz frame, #300).
@@ -1871,11 +1894,62 @@ void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
     FBLOG("presentation blocked: %s on head %u (%llu us since its submit; latch waits %d timeouts %d late %d max %d us)",
           why, fHead, (unsigned long long)(ns / 1000), gFlipLatchWaits, gFlipLatchTimeouts, gFlipLatchLate, gFlipLatchMaxUs);
 }
+// Called under the display gate before power/reset invalidates the notifier. An unresolved submission is never
+// bridged by a later completion: fault and keep both scanout pins, just like the existing stuck-flip path.
+void NVRMNVDAFramebuffer::invalidateLanding()
+{
+    // Only a private waiter owes a landing proof; legacy bootstrap/latch=0/2 power behavior is unchanged.
+    if (fLandingOwed && fCompleted != fSubmitted) {
+        waitFlipDone(0); // the last flip may have landed since the waiter's most recent poll
+        if (fCompleted != fSubmitted) fSubmissionFaulted = true;
+    }
+    if (fLandingEpoch == ~0ull) fSubmissionFaulted = true;
+    else ++fLandingEpoch;
+}
+
+bool NVRMNVDAFramebuffer::waitLandedUngated(const NVFlipToken &token)
+{
+    // NO outer NVRMDisplayGate here or in the platform pure branch. Retained by that branch through this wait.
+    bool over = false;
+    for (;;) {
+        {
+            NVRMDisplayGate gate;
+            if (!gate.valid() || !token.sequence || token.epoch != fLandingEpoch || OSAddAtomic(0, &fStopping) ||
+                fSubmissionFaulted || fFlipPowerInvalid || !fKms || !fDev || fSubmissionDevice != fDev) return false;
+            const bool landed = fCompleted >= token.sequence || waitFlipDone(0);
+            uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - token.submitAbs, &ns);
+            const uint64_t us = ns / 1000;
+            if (!over && us > token.boundUs) {
+                over = true;
+                OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
+            }
+            if (landed && fCompleted >= token.sequence) {
+                const int elapsed = (int)us;
+                if (elapsed > gFlipLatchMaxUs) gFlipLatchMaxUs = elapsed;
+                if (presentStatsNote(fHead, token.boundUs, true, over, false, (uint32_t)us)) PRESENT_STATS_LOG();
+                return true;
+            }
+            // No millisecond fallback under memory pressure: without the 250 us sleep primitive, fail closed.
+            if (!sFlipWaitLock) { fSubmissionFaulted = true; return false; }
+            if (us >= kFlipStuckUs) {
+                flipFaultLog("submitted completion unavailable (ungated)");
+                fSubmissionFaulted = true; return false;
+            }
+        }
+        // The short gate above protects fDev/notifier/lifetime state, never a sleep. Wakes are hints only.
+        uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
+        IOLockLock(sFlipWaitLock);
+        IOLockSleepDeadline(sFlipWaitLock, (event_t)&sFlipWakeEv[fHead < 8 ? fHead : 0], next, THREAD_UNINT);
+        IOLockUnlock(sFlipWaitLock);
+    }
+}
+
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly, bool frame)
+                                            bool cursorOnly, bool frame, NVFlipToken *defer)
 {
-    if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted) return NV_FALSE;
+    if (defer) *defer = NVFlipToken();
+    if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted || OSAddAtomic(0, &fStopping) || fFlipPowerInvalid) return NV_FALSE;
     if (!commit) return fKms->applyModeSetConfig(fDev, cfg, rep, NV_FALSE);
     // A cursor-only request leaves the primary layer alone: KAPI does not advance the primary layer's completion slot
     // for it, so there is no primary flip to wait for and the primary tracking below stays as the last present left it.
@@ -1898,6 +1972,10 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
             if (frame && presentStatsNote(fHead, flipWaitUs(), false, false, true, 0)) PRESENT_STATS_LOG();
             rep->flipResult = NV_KMS_FLIP_RESULT_IN_PROGRESS; return NV_FALSE;
         }
+    }
+    // Saturate rather than wrap a token, and fail closed if an unexpected device replacement left a hole.
+    if (fSubmitted == ~0ull || (fSubmissionDevice && fSubmissionDevice != fDev)) {
+        invalidateLanding(); fSubmissionFaulted = true; return NV_FALSE;
     }
     const bool tracked = cfg->headRequestedConfig[fHead].modeSetConfig.bActive &&
         cfg->headRequestedConfig[fHead].layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config.surface;
@@ -1951,6 +2029,15 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     }
     fSubmissionSeen = true;
     fFlipSubmitAbs = submit0;
+    fSubmissionDevice = fDev;
+    ++fSubmitted;
+    if (defer && frame && !bootstrap && gFlipUngated && gFlipLatch == 1) {
+        fLandingOwed = true;
+        defer->epoch = fLandingEpoch; defer->sequence = fSubmitted;
+        defer->submitAbs = submit0; defer->boundUs = flipWaitUs();
+        OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
+        return NV_TRUE; // accepted, not landed; only the private pure non-HOME caller may defer
+    }
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
     if (bootstrap || !gFlipLatch) return NV_TRUE;
     if (gFlipLatch == 2) { OSIncrementAtomic((volatile SInt32 *)&gFlipLatchDeferred); return NV_TRUE; }
@@ -2488,12 +2575,10 @@ uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
     uint64_t ns = 16666667ull;
     if (t.pixelClockHz && t.hTotal && t.vTotal) {
         const uint64_t q = (uint64_t)t.hTotal * t.vTotal * 1000000000ull / t.pixelClockHz;
-        // 2 ms..50 ms is 500 Hz..20 Hz. When NVKMS refuses the hardware vblank this period paces the
-        // software fallback that drives WindowServer, so the window has to reach the real panel rate:
-        // a 4 ms floor (250 Hz) dropped 280/300/360 Hz panels back to the 60 Hz default and the frame
-        // delivery beat against the scan-out. A sub-2 ms period only comes from an implausible pixel
-        // clock, so it still falls back to 60 Hz rather than spinning the timer.
-        if (q >= 2000000ull && q <= 50000000ull) ns = q;
+        // Match flipWaitUs(): 1 ms..50 ms covers validated panel timings through 1000 Hz.
+        // A 2 ms floor incorrectly returned 60 Hz for real 540/600 Hz panels whenever
+        // hardware vblank registration failed.
+        if (q >= 1000000ull && q <= 50000000ull) ns = q;
     }
     uint64_t abs = 0; nanoseconds_to_absolutetime(ns, &abs); return abs;
 }
@@ -2839,13 +2924,20 @@ void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)
 }
 void NVRMNVDAFramebuffer::stop(IOService *provider)
 {
+    {
+        // Serialize invalidation with each ungated poll, but do not hold the gate while draining thread calls.
+        NVRMDisplayGate gate;
+        invalidateLanding();
+        if (fFlipCacheLock) {
+            IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+            fStopping = 1;
+            IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+        } else fStopping = 1;
+        // stop deliberately does not destroy fDev, surfaces or duplicate-memory pins. A failed/STOPped wait
+        // returns IOError (the accelerator releases its IOSurface); these FB pins must survive that release.
+    }
     if (fAudioReady) { fAudioReady->remove(); fAudioReady = nullptr; }
     if (fCodecReady) { fCodecReady->remove(); fCodecReady = nullptr; }
-    if (fFlipCacheLock) {
-        IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
-        fStopping = 1;
-        IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
-    }
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
@@ -3635,6 +3727,7 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vramtest_mode, CTLFLAG_RW | CTLFLAG_LOCKED, 
 static int gFlipInterval = 1;
 // gFlipLatch and the counters are defined above submitConfig, where the completion wait drives them.
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipLatch, 0, "1 = a committed flip waits for its completion before a surface retires (0 = debug bypass, 2 = deferred: the next submit verifies it)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_ungated, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipUngated, 0, "1 = pure non-HOME landing wait outside the display gate (default); 0 = gated wait");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_deferred, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchDeferred, 0, "flips verified by the next submit instead of waited for");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_latch_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipLatchWaits, 0, "flips that waited for completion");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_guard_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, &gGuardCleared, 0, "1 once the boot guard was cleared this boot");
@@ -3669,6 +3762,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_ungated);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_deferred);
@@ -3868,7 +3962,12 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
     bool isAlloc = functionName && functionName->isEqualTo(NVRM_VRAM_FN_ALLOC);
     bool isFree  = functionName && functionName->isEqualTo(NVRM_VRAM_FN_FREE);
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
+        NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
         const uintptr_t st = (uintptr_t)param1;
+        // NVRM notifies state 0 BEFORE nvKmsSuspend, and state 1/2 after resume. Invalidate before the notifier
+        // can be reset; an unresolved flip faults permanently, never masquerades as landed on a resumed device.
+        if (st != 1) { invalidateLanding(); fFlipPowerInvalid = true; }
+        else fFlipPowerInvalid = false;
         if (st == 0) {
             if (fModeSet && fSurf) fHeadSlept = true;   // nvKmsSuspend shuts every head down
             fSysSlept = true;                            // the next power-on is a system wake (familyDidWake)
@@ -3910,12 +4009,16 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
     if (functionName && functionName->isEqualTo("nvFlipToSurfacePure")) {
         struct NVRMFlipRequest *f = (struct NVRMFlipRequest *)param1;
         if (!f || f->version != NVRM_FLIP_ABI_VERSION) return kIOReturnBadArgument;
+        retain(); NVRMCallReference callReference(this);
+        NVFlipToken token;
         int rc = -1;
         const bool home = (f->flags & 1u) != 0;
         const bool pureHome = home && fModeSet;
         if (pureHome) { fHomePure++; if (fHomePure <= 4) FBLOG("home flip #%u: pure (head %u already lit, no modeset)", fHomePure, fHead); }
         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
-                               f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
+                               f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie, home ? nullptr : &token);
+        // flipToMemory's gate has been destroyed. Acceptance is NOT exposed through the platform ABI.
+        if (ok && token.sequence && !waitLandedUngated(token)) { ok = false; rc = -1; }
         f->flipResult = rc;
         // Busy: the previous flip is still on its way to the panel; the caller keeps its frame and presents the next.
         return ok ? kIOReturnSuccess : rc == (int)NV_KMS_FLIP_RESULT_IN_PROGRESS ? kIOReturnBusy : kIOReturnIOError;
@@ -3945,9 +4048,10 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 }
 
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
-                                   unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
+                                   unsigned pitch, int *rcOut, bool pure, UInt64 cookie, NVFlipToken *defer)
 {
-    NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted || OSAddAtomic(0, &fStopping) || fFlipPowerInvalid) return false;
+    if (defer) *defer = NVFlipToken();
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -3978,7 +4082,8 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     }
     if (!surf) {
-        // Prior accepted submissions complete before returning; no non-front cache entry is in flight.
+        // A private deferred submit can still be in flight. Never evict even a non-front slot until priorFlipState
+        // proves the latest primary landed; it may be the surface that primary is replacing.
         unsigned slot = 16;
         for (unsigned i = 0; i < 16; ++i) if (!fFlipCache[i].surf) { slot = i; break; }
         if (slot == 16) for (unsigned i = 0; i < 16; ++i)
@@ -4043,7 +4148,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     if (!lean)
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
     const uint64_t ft0 = mach_absolute_time();
-    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true);
+    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true, pure && mem ? defer : nullptr);
     if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
         OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us; }
     // IN_PROGRESS on a refusal is the previous flip still on its way (submitConfig's late path, or NVKMS's own answer

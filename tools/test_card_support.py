@@ -131,7 +131,8 @@ def device_table():
     assert keys == sorted(set(keys)) and all(re.fullmatch(r"[0-9A-F]{4}", k) for k in keys), "ids: sorted, unique, 4 upper-case hex"
     count = re.search(r"carries (\d+) distinct display-card PCI device IDs", (ROOT / "docs/CARD-SUPPORT.md").read_text())
     assert count and int(count.group(1)) == len(keys), ("docs/CARD-SUPPORT.md", count and count.group(1), len(keys))
-    print("PASS device table: %d ids; the installer and CARD-SUPPORT.md agree" % len(keys))
+    assert {"2803", "2805"}.issubset(keys), "RTX 4060 Ti 8 GB / 16 GB installer IDs must remain covered"
+    print("PASS device table: %d ids; installer/docs agree; both RTX 4060 Ti IDs covered" % len(keys))
 
 device_table()
 with tempfile.TemporaryDirectory(prefix="nullmoth-card-tests-") as directory:
@@ -143,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="nullmoth-card-tests-") as directory:
     vendor = snippet("plugin/NVMTLVendorCompiler.m", "static const struct nvmtl_hwinfo *nvmtl_vendor_hwinfo(void) {", "static dispatch_data_t nvmtl_vendor_target_data")
     (tmp / "vendor.m").write_text(VENDOR.replace("PRODUCTION", vendor))
     run("xcrun", "clang", "-fblocks", str(tmp / "vendor.m"), "-framework", "Foundation", "-o", str(tmp / "vendor"))
-    cases = {"TU106": "7 5 1", "GA100": "8 0 1", "GA10B": "8 7 1", "GA106": "8 6 1", "AD107": "8 9 1", "GH100": "9 0 1", "GB100": "10 0 1", "GB206": "12 0 1", "UNKNOWN": "0 0 0", "XX999": "0 0 0"}
+    cases = {"TU106": "7 5 1", "GA100": "8 0 1", "GA10B": "8 7 1", "GA106": "8 6 1", "AD102": "8 9 1", "AD103": "8 9 1", "AD104": "8 9 1", "AD106": "8 9 1", "AD107": "8 9 1", "GH100": "9 0 1", "GB100": "10 0 1", "GB206": "12 0 1", "UNKNOWN": "0 0 0", "XX999": "0 0 0"}
     for chip, expected in cases.items():
         assert run(str(tmp / "vendor"), "NVIDIA (NVK " + chip + ")") == expected, chip
     assert run(str(tmp / "vendor")) == "0 0 0"

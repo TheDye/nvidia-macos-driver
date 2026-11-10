@@ -1,23 +1,41 @@
 #!/bin/bash
-set -u
+# Build the current checkout without installing. Usage: build_plugin.sh [output-directory]
+set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-N=$HOME/nvmtl-build; S=$N/LIVE/plugin; L=$N/build.lock
-cd $S || exit 2
-[ -z "$(git status --porcelain)" ] || { echo "STOP: LIVE/plugin has uncommitted edits — commit them first:"; git status --short | head; exit 3; }
-C=$(git rev-parse --short HEAD); O=$N/LIVE/out/plugin-$C${RELEASE:+-release}; mkdir -p $O
-RDEF=""; [ -n "${RELEASE:-}" ] && RDEF="-DNVMTL_RELEASE=1"
-until mkdir $L 2>/dev/null; do sleep 5; done; echo "build_plugin $C $$" > $L/owner; trap 'rm -rf "$L"' EXIT
-xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 $RDEF -Wno-protocol -Wno-incomplete-implementation \
-  -I"$HOME/Vulkan-Headers/include" -o $O/NVMTLDriver NVMTLDevice.m nvmtl_dlss.c dlss/elfhost.c dlss/lnxlibc.c \
-  -framework Foundation -framework Metal -framework IOSurface -framework MetalFX -liconv 2>$O/NVMTLDriver.err \
-  || { echo "STOP: compile failed"; grep -A2 ': error:' $O/NVMTLDriver.err | head -30; exit 5; }
-codesign -f -s - $O/NVMTLDriver 2>/dev/null
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+S=${NVMTL_PLUGIN_SOURCE:-$HERE/plugin}
+if [ "$#" -gt 1 ]; then echo "usage: $0 [output-directory]" >&2; exit 2; fi
+O=${1:-${NVMTL_PLUGIN_OUTPUT:-$(mktemp -d "${EMPRYO_TMP:-${TMPDIR:-/tmp}}/nvmtl-plugin.XXXXXX")}}
+mkdir -p "$O"
+O=$(cd "$O" && pwd)
+L=$O/.build.lock
+mkdir "$L" 2>/dev/null || { echo "STOP: build already owns $L" >&2; exit 3; }
+trap 'rmdir "$L"' EXIT
+cd "$S"
+C=$(git rev-parse --short HEAD 2>/dev/null || printf 'working-tree')
+RDEF=(); [ -z "${RELEASE:-}" ] || RDEF=(-DNVMTL_RELEASE=1)
+xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 "${RDEF[@]}" -Wno-protocol -Wno-incomplete-implementation -Werror=unguarded-availability-new \
+  -I"${VULKAN_HEADERS:-$HOME/Vulkan-Headers/include}" -o "$O/NVMTLDriver" NVMTLDevice.m nvmtl_dlss.c dlss/elfhost.c dlss/lnxlibc.c \
+  -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework MetalFX -liconv 2>"$O/NVMTLDriver.err" \
+  || { echo "STOP: compile failed; see $O/NVMTLDriver.err"; grep -A2 ': error:' "$O/NVMTLDriver.err" | head -30; exit 5; }
+codesign -f -s - "$O/NVMTLDriver"
+codesign --verify --strict "$O/NVMTLDriver"
+minos=$(vtool -show-build "$O/NVMTLDriver" | awk '/minos/{print $2; exit}')
+[ "$minos" = 15.0 ] || { echo "STOP: minos $minos, not 15.0"; exit 6; }
+# Preserve the existing live-feature checks for checkout and explicit-output builds.
 miss=0
 while IFS='|' read -r feat pat; do
-  [ -z "$feat" ] && continue
-  n=$(strings -a $O/NVMTLDriver | grep -c -- "$pat")
-  case "$feat" in "fps file"|"passtime instrument") if [ -n "${RELEASE:-}" ]; then [ "$n" -eq 0 ] || { echo "  LEAKED diagnostic $feat  ($pat)"; miss=$((miss+1)); }; continue; fi;; esac
-  [ "$n" -ge 1 ] || { echo "  MISSING $feat  ($pat)"; miss=$((miss+1)); }
+  [ -n "$feat" ] || continue
+  n=$(strings -a "$O/NVMTLDriver" | grep -c -- "$pat" || true)
+  # FPS now deliberately remains available to NVMTL_PROCESS_ENV=1 processes;
+  # only the request-file passtime instrument is compiled out of releases.
+  case "$feat" in "passtime instrument")
+    if [ -n "${RELEASE:-}" ]; then
+      [ "$n" -eq 0 ] || { echo "LEAKED diagnostic $feat ($pat)"; miss=$((miss+1)); }
+      continue
+    fi;;
+  esac
+  [ "$n" -ge 1 ] || { echo "MISSING $feat ($pat)"; miss=$((miss+1)); }
 done <<'M'
 vendor compiler lane (NVIDIAShared)|NVIDIAShared
 SASS dispatch on NVK (sasspipe)|nvmtl_nvk_dispatch_sass_v1
@@ -32,6 +50,6 @@ library key memo (xlate)|library key memo: hit
 res2-evict (Apple order: newest wins the card)|on the allocating thread
 DLSS behind the MetalFX temporal scaler|served by DLSS
 M
-echo "plugin-$C  sha $(shasum -a256 $O/NVMTLDriver | cut -c1-8)  uuid $(otool -l $O/NVMTLDriver | awk '/uuid/{print $2; exit}')  warnings $(grep -c ': warning:' $O/NVMTLDriver.err)  markers-missing $miss"
-[ $miss = 0 ] || { echo "STOP: a live feature is missing from this build — do NOT stage it"; exit 6; }
+[ "$miss" -eq 0 ] || { echo "STOP: missing live feature; do NOT stage"; exit 6; }
+echo "plugin-$C sha256 $(shasum -a 256 "$O/NVMTLDriver" | cut -d' ' -f1) minos $minos warnings $(grep -c ': warning:' "$O/NVMTLDriver.err" || true)"
 echo "$O/NVMTLDriver"

@@ -51,7 +51,8 @@ check('bind time: an impossible handle leaves the slot empty before the table is
       'nvmtl_handle_plausible(h)' in bind and bind.find('nvmtl_handle_plausible(h)') < bind.index('if (!c->table)')
       and 'kind = NVMTL_SLOT_NONE; h = NULL; off = 0;' in bind)
 check('snapshot time: both descriptor loops read their slot through the check',
-      src.count('nvmtl_slot_checked(t ? &t->s[which][i] : NULL, which, i)') == 2)
+      src.count('nvmtl_slot_checked(t ? &t->s[which][i] : NULL, which, i)') == 2
+      + ('static void nvmtl_descriptor_handles(' in src))  # snapshot reuse compares checked handles too
 check('no descriptor loop reads a slot unchecked', 'const nvmtl_slot *sl = t ? &t->s[which][i] : NULL;' not in src)
 k = src.find('static const nvmtl_slot *nvmtl_slot_checked(')
 chk = src[k:src.index('\n}\n', k)] if k >= 0 else ''

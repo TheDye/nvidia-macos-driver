@@ -20,6 +20,47 @@ They are outside the present GSP-based driver. Headless compute cards are not pr
 macOS desktop. A laptop also needs a display/output route the NVIDIA card can drive; accepting
 its PCI ID does not implement an Optimus display mux.
 
+## Ada and browser limits (public reports checked 2026-11-10)
+
+RTX 4060 Ti installer IDs `2803` (8 GB) and `2805` (16 GB) are already present.
+The optional vendor compiler maps AD106, like the other AD10 chips, to `sm_89`;
+no additional PCI-ID or shader-target patch is needed. These checks do not change
+Ada's physical validation status above.
+
+`plugin/NVMTLDevice.m` enables ANGLE Metal for recognised Chromium/CEF/Electron
+processes, app frameworks, or loaded `libGLESv2.dylib`/`libEGL.dylib` libraries.
+`NVMTL_ANGLE_METAL=0` opts out and `=1` forces the rule. This permits a backend;
+it does not prove WebGL, browser scrolling or all Electron apps render correctly.
+The constructor preserves existing ANGLE overrides, including lists longer than 1024 bytes.
+
+H.264/HEVC VideoToolbox decoder registration exists in-process and at plugin load
+in `VTDecoderXPCService` (asynchronously). Sandboxed Apple apps delegate to that
+service. Registration code is not proof of hardware decode in a particular app;
+codec selection, plugin loading and sandbox access still need runtime verification.
+VP9/AV1 registration is absent from this plugin, despite Ada hardware capability.
+Do not disable a browser sandbox to claim hardware-decode support.
+
+Relevant public evidence (reports and proposals, not reproduced acceptance tests):
+
+- [#456](https://github.com/nullmoth/nvidia-macos-driver/issues/456) and
+  [#356](https://github.com/nullmoth/nvidia-macos-driver/issues/356): compositor CPU cost on RTX 3060 laptops.
+- [#424](https://github.com/nullmoth/nvidia-macos-driver/issues/424): RTX 4060 Laptop high-refresh phase hypothesis;
+  it does not establish the cause on an RTX 4060 Ti desktop.
+- [#462](https://github.com/nullmoth/nvidia-macos-driver/issues/462): RTX 4060/X99 small-BAR stutter;
+  not proof that every 256 MB BAR causes the same failure.
+- [#370](https://github.com/nullmoth/nvidia-macos-driver/issues/370): RTX 2070 SUPER shader translation cost.
+  [#122](https://github.com/nullmoth/nvidia-macos-driver/issues/122) is closed and concerns older boot/mode flicker.
+- Open [#452](https://github.com/nullmoth/nvidia-macos-driver/issues/452): WebKit context loss despite Chrome working;
+  [#481](https://github.com/nullmoth/nvidia-macos-driver/pull/481): Chromium surface-publication proposal;
+  [#414](https://github.com/nullmoth/nvidia-macos-driver/issues/414): RTX 4060 Ti sandboxed decode report;
+  [#487](https://github.com/nullmoth/nvidia-macos-driver/pull/487): proposed Ada VP9/AV1 decode, not implemented here;
+  [#335](https://github.com/nullmoth/nvidia-macos-driver/issues/335): RTX 4060 Ti DisplayPort audio missing.
+
+The [website](https://nullmothsystems.com) currently advertises 235 card IDs, whereas
+this source's installer lists 249. Use the checked source table, not the website
+counter, for this revision. [1401](https://github.com/nullmoth/1401) is a separate
+installer/log-collection project, not independent evidence that every supported ID works.
+
 ## Startup correction
 
 When BAR placement uses the fallback, automatic GPU startup waits 100 seconds. Previously the
@@ -87,6 +128,9 @@ successful device-table lookup cannot prove a card initialized correctly.
 ## Regressions
 
 Run `python3 tools/test_card_support.py` on macOS with command line developer tools. The tests
-check that both installers' `SUPPORTED_IDS` and this page's count match `nvidia_gsp_ids.json`, then
-compile production snippets for startup timing, chip selection, release error classification,
-desktop completion ordering, and upload ordering. They require neither GPU access nor a driver installation.
+check this installer's sorted, unique `SUPPORTED_IDS`, both RTX 4060 Ti IDs and this page's count,
+then compile production snippets for startup timing, chip selection (including AD106), release error
+classification and desktop completion ordering. The 1401 ID-copy and upload-order tests live in
+that separate repository. Run `python3 tools/test_angle_chrome_family.py` and
+`python3 tools/test_angle_optin.py` for ANGLE process/override policy. These CPU tests require
+neither GPU access nor a driver installation; they do not validate hardware performance.

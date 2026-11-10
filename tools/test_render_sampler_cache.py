@@ -19,6 +19,7 @@ assert '_vertexSamplers[key]=state' not in source
 
 fixture = r'''
 #import <Foundation/Foundation.h>
+#include <os/lock.h>
 #include <assert.h>
 ''' + helpers + r'''
 @interface Cache : NSObject {

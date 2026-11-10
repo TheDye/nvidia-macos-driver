@@ -133,6 +133,16 @@ int main() {
     assert(!gIopFlipped[0] && "HOME on the panel clears the flag");
     gIopFlipped[0] = true; fb.answer = kIOReturnIOError; nvAccelIopHome(&fb, 0);
     assert(!gIopFlipped[0] && "a refused HOME clears the flag, as before");
+    // A post-acceptance FB timeout/STOP is IOError, not shown or busy. The existing accelerator releases the
+    // submitted IOSurface and completes the transaction: the FB's duplicate-memory pin MUST outlive that release.
+    IOSurface *front = gIopFlipFront[0], *prev = gIopFlipPrev[0];
+    const int beforeFailure = gSignals;
+    fb.answer = kIOReturnIOError;
+    assert(nvAccelIopAsyncStart(&pipe, &fb, 0, &E, &f) && E.rc == 2);
+    runWorker();
+    assert(E.rc == 1 && gCntIopAsyncRefused == 1 && gCntIopLate == 1);
+    assert(gSignals == beforeFailure + 1 && !nvAccelIopAsyncBusy(&pipe));
+    assert(gIopFlipFront[0] == front && gIopFlipPrev[0] == prev && "a failed wait must never retire the prior front as shown");
     printf("OK\n");
     return 0;
 }

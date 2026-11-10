@@ -101,8 +101,8 @@ python3 tools/bench_event_wait.py /tmp/nvmtl-event-wait-results
 ```
 
 Use a new output directory. The runner compiles the probe into a temporary
-directory, alternates both policies for five rounds, verifies the event-wait
-log, compares image hashes, and stops on a probe failure, timeout, or a changed
+directory, alternates both policies for five rounds, verifies actual wait-path
+counters when available (otherwise the legacy event-wait log), compares image hashes, and stops on a probe failure, timeout, or a changed
 WindowServer PID. It then checks cross-queue synchronization and buffer copies
 with both policies. `--rounds 1` is a smoke test, not the five-round measurement.
 The tool writes local results and logs; it does not upload anything or edit the
@@ -117,7 +117,7 @@ For an individual probe, compile and run:
 ```sh
 xcrun clang -O2 -fobjc-arc tools/bench_event_wait.m \
   -framework Foundation -framework Metal -framework CoreGraphics \
-  -framework CoreImage -o /tmp/nvmtl-event-wait-probe
+  -framework CoreImage -framework IOKit -o /tmp/nvmtl-event-wait-probe
 /tmp/nvmtl-event-wait-probe compute NVRM_EVENT_WAIT=0
 /tmp/nvmtl-event-wait-probe compute NVRM_EVENT_WAIT=1
 ```

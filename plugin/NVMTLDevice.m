@@ -318,18 +318,19 @@ static bool nvmtl_decode_is_delegated(const char *me)
 }
 static void nvmtl_nvdec_register(void)
 {
+    const char *me = getprogname();
+    if (getenv("NVMTL_NO_NVDEC")) { nvlog("nvdec: NVMTL_NO_NVDEC set - not registering in %s", me); return; }
+    if (!strcmp(me, "WindowServer")) return;
+    if (nvmtl_decode_is_delegated(me)) {
+        nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process H.264 decoder (delegates to VTDecoderXPCService)", me);
+        return;
+    }
+    typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
+    RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
+    // A Metal load can precede VideoToolbox: leave the once token available for a later device/load attempt.
+    if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - deferring registration", me); return; }
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *me = getprogname();
-        if (getenv("NVMTL_NO_NVDEC")) { nvlog("nvdec: NVMTL_NO_NVDEC set - not registering in %s", me); return; }
-        if (!strcmp(me, "WindowServer")) return;
-        if (nvmtl_decode_is_delegated(me)) {
-            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process H.264 decoder (delegates to VTDecoderXPCService)", me);
-            return;
-        }
-        typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
-        RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
-        if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering", me); return; }
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvdec_register, &di) || !di.dli_fname) { nvlog("nvdec: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -434,18 +435,19 @@ static void nvmtl_nvencvt_register(void)
 }
 static void nvmtl_nvdec_hevc_register(void)
 {
+    const char *me = getprogname();
+    if (getenv("NVMTL_NO_NVDEC_HEVC")) { nvlog("nvdec: NVMTL_NO_NVDEC_HEVC set - not registering HEVC in %s", me); return; }
+    if (!strcmp(me, "WindowServer")) return;
+    if (nvmtl_decode_is_delegated(me)) {
+        nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process HEVC decoder (delegates to VTDecoderXPCService)", me);
+        return;
+    }
+    typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
+    RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
+    // Do not permanently consume registration when VideoToolbox has not been loaded yet.
+    if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - deferring HEVC registration", me); return; }
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *me = getprogname();
-        if (getenv("NVMTL_NO_NVDEC_HEVC")) { nvlog("nvdec: NVMTL_NO_NVDEC_HEVC set - not registering HEVC in %s", me); return; }
-        if (!strcmp(me, "WindowServer")) return;
-        if (nvmtl_decode_is_delegated(me)) {
-            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process HEVC decoder (delegates to VTDecoderXPCService)", me);
-            return;
-        }
-        typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
-        RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
-        if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering HEVC", me); return; }
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvdec_hevc_register, &di) || !di.dli_fname) { nvlog("nvdec: dladdr failed - not registering HEVC"); return; }
         char dir[1024], path[1200];
@@ -462,19 +464,23 @@ static void nvmtl_nvdec_hevc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
-// GH #175: with Chrome's GPU sandbox on, decoding runs in VTDecoderXPCService. Metal maps this bundle there (the
-// process holds the bundle's mappings but never creates a Metal device), but the decoders were registered only when a Metal
-// device came up, so that process never had them and H.264 fell to AppleH264SW. The decoder libraries open NVRM
-// themselves (IOKit; nothing from the Vulkan device), as NVIDIA's own decoder is a per-process capability needing no
-// render device. So in that one process register them at load, telling Blackwell apart by the GPU's PCI device id
-// instead of the Vulkan device name.
-static void nvmtl_nvdec_hevc_register(void);
+// GH #175: the decode service may map this bundle without creating a Metal device. Register there off the loader
+// thread as before. NVMTL_EAGER_NVDEC=1 lets unsandboxed test clients register synchronously before dlopen returns.
+// It is OFF by default: VT symbol availability does not prove constructor/VT lock ordering safe during discovery.
+// Do not load VideoToolbox recursively from its own plugin discovery or force it into
+// sandboxed apps; Apple apps still delegate and other sandboxed clients register on device creation. VT may already
+// have cached a capability answer before discovering this bundle, so load-time registration cannot guarantee that answer.
 __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
 {
     const char *me = getprogname();
-    if (!nvmtl_is_decode_service(me) || getenv("NVMTL_NO_NVDEC")) return;
-    // off the loader's thread: the registration dlopens the decoder library
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    if (!strcmp(me, "WindowServer") || getenv("NVMTL_NO_NVDEC")) return;
+    const bool service = nvmtl_is_decode_service(me);
+    if (!service) {
+        const char *eager = getenv("NVMTL_EAGER_NVDEC");
+        if (!eager || strcmp(eager, "1") || nvmtl_is_sandboxed()) return;
+    }
+    if (!dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo")) return;
+    void (^registerDecoders)(void) = ^{
         uint32_t dev = 0;
         io_iterator_t it = IO_OBJECT_NULL;
         if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &it) == KERN_SUCCESS) {
@@ -495,11 +501,13 @@ __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
         char layout[32];
         if (nvmtl_gpu_profile_string(CFSTR("video-layout"), layout, sizeof layout)) g_video_blackwell = !strcmp(layout, "blackwell");
         else g_video_blackwell = dev >= 0x2b00 && dev < 0x3000;   // no profile (older NVRM): the GB20x device-id block
-        nvlog("nvdec: decode service, GPU 10de:%04x (%s): registering the decoders at load", dev,
+        nvlog("nvdec: %s, GPU 10de:%04x (%s): registering the decoders at load", me, dev,
               g_video_blackwell ? "Blackwell" : "before Blackwell");
         nvmtl_nvdec_register();
         nvmtl_nvdec_hevc_register();
-    });
+    };
+    if (service) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), registerDecoders);
+    else registerDecoders();
 }
 static void nvmtl_nvenc_hevc_register(void)
 {
@@ -531,10 +539,10 @@ static void nvmtl_nvenc_hevc_register(void)
     });
 }
 // ANGLE refuses Metal on NVIDIA (disableMetalOnNvidia), and Chromium on macOS has no other GL backend, so without this
-// the GPU process exits at start-up and the app draws everything on the CPU. Chrome, Chromium, Brave, Edge and Discord
-// get it by default: without it their GPU process cannot start. Electron stays opt-in (NVMTL_ANGLE_METAL=1) because it showed artifacts,
-// stutter and lost transparency on several cards. NVMTL_ANGLE_METAL=0 turns the rule off in every process. An existing
-// ANGLE override is kept; no sandbox setting is changed.
+// the GPU process can fail at start-up or fall back to software. Chrome, Chromium, Brave, Edge, Discord and recognised
+// Electron/CEF hosts get the rule by default through the checks below. Other apps can opt in with NVMTL_ANGLE_METAL=1;
+// NVMTL_ANGLE_METAL=0 turns the rule off in every process. This permits the backend, not artifact-free rendering.
+// Existing ANGLE overrides are kept; no sandbox setting is changed.
 // Matched three ways: by process name, by the frameworks in the app bundle, and by ANGLE's own libraries
 // (libGLESv2.dylib, libEGL.dylib) already loaded in the process. The loaded-library check covers Chromium-based apps
 // whose names and bundles the first two miss (Vivaldi, Opera, Arc and other CEF hosts). It is an addition, not a
@@ -597,17 +605,21 @@ __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
     const char *opt = getenv("NVMTL_ANGLE_METAL");
     if (opt && !strcmp(opt, "0")) return;
     const char *me = getprogname();
-    if (!(opt && !strcmp(opt, "1")) && !nvmtl_angle_chrome_family()) return;
+    const bool webkit = me && !strcmp(me, "com.apple.WebKit.GPU");
+    if (!(opt && !strcmp(opt, "1")) && !webkit && !nvmtl_angle_chrome_family()) return;
     const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
     const char *cur = getenv(key);
     if (cur && strstr(cur, rule)) return;
-    // One line per process, outside nvlog's release failure filter: a field report must show whether the rule was
-    // active in this process.
+    // Do not truncate the caller's overrides or the appended rule at a fixed buffer boundary.
+    char *v = NULL;
+    if (asprintf(&v, "%s%s%s", cur ? cur : "", (cur && *cur) ? ":" : "", rule) < 0) return;
+    int status = setenv(key, v, 1);
+    free(v);
+    if (status != 0) return;
+    // One line per process, outside nvlog's release failure filter, only after the environment was updated.
     syslog(LOG_NOTICE, "NullMoth: angle: Metal allowed in %s (%s; NVMTL_ANGLE_METAL=0 disables)", me ? me : "?",
-           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : "Chrome family");
-    char v[1024];
-    if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
-    setenv(key, v, 1);
+           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : (webkit ? "WebKit GPU" : "Chrome family"));
+
 }
 static bool nvmtl_process_is_allowed(void)
 {
@@ -651,6 +663,7 @@ static bool nvmtl_process_is_allowed(void)
 #include "nvmtl_dlss.h"
 static BOOL nvmtl_m4_enabled(void);   // NVMTLMetal4.m, later in this translation unit
 static id<MTLCommandBuffer> nvmtl_m4_underlying(id cb);
+static NSOperationQueue *nvmtl_pipeline_compile_queue(void);
 void nvmtl_m4_note_buffer(id buf, uint64_t addr, uint64_t length);
 int nvmtl_m4_note_current(_Atomic uint64_t note[3], uint64_t addr, uint64_t length);
 void nvmtl_m4_note_buffer_cached(id buf, uint64_t addr, uint64_t length, _Atomic uint64_t note[3]);
@@ -1079,7 +1092,11 @@ static inline BOOL nvmtl_bgr10_storage_remap(MTLTextureDescriptor *d, uint32_t *
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
 static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
-static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane); }
+static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) {
+    if (plane == 0) return (CFStringRef)CFRetain(CFSTR("NVMTLVramAt:p0"));
+    if (plane == 1) return (CFStringRef)CFRetain(CFSTR("NVMTLVramAt:p1"));
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane);
+}
 static int nvmtl_vram_tag_current(IOSurfaceRef surf, NSUInteger plane, uint32_t seed)
 {
     CFStringRef k = nvmtl_vram_tag_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
@@ -1118,7 +1135,11 @@ typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint
 #define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
-static CFStringRef nvmtl_busy_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane); }
+static CFStringRef nvmtl_busy_key(NSUInteger plane) {
+    if (plane == 0) return (CFStringRef)CFRetain(CFSTR("NVMTLBusyAt:p0"));
+    if (plane == 1) return (CFStringRef)CFRetain(CFSTR("NVMTLBusyAt:p1"));
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
+}
 static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
 {
     CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
@@ -1154,6 +1175,97 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
         if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
+// Item 7 import cache. Core Animation wraps the same IOSurface in a fresh MTLTexture for many updates; each wrapper used to
+// import the surface's VRAM again (an fd, a VkDeviceMemory import, a VA map) and free it on dealloc, all on WindowServer's
+// render thread. Wrappers of one surface now share one import, kept a short while after the last wrapper goes. An entry
+// retains its IOSurface, so the surface ID it is keyed by cannot be reused while the entry exists. NVMTL_NO_VRAM_IMPORT_CACHE=1
+// restores one import per wrapper.
+// 48 slots thrashed on a busy desktop: WindowServer wraps more live surfaces than that (every window, layer backing store and
+// Chrome tile), so the oldest idle import was destroyed and the same surface imported again on the render thread a moment
+// later (an fd, a VkDeviceMemory import and a VA map). Entries still leave after a second idle, so this only keeps imports
+// of surfaces in use within the last second.
+#include <os/lock.h>
+#define NVMTL_VRAMC_N 128
+#define NVMTL_VRAMC_IDLE_NS 1000000000ull
+typedef struct { IOSurfaceRef surf; uint32_t id; size_t need; nvk_buffer b; uint32_t refs; uint64_t idle_ns; } nvmtl_vramc_ent;
+static nvmtl_vramc_ent g_vramc[NVMTL_VRAMC_N];
+static os_unfair_lock g_vramc_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic unsigned long long g_vramc_hit, g_vramc_miss;
+static int nvmtl_vramc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_NO_VRAM_IMPORT_CACHE"); on = !(e && e[0] == '1');
+                  nvlog("item 7: IOSurface VRAM imports are %s (NVMTL_NO_VRAM_IMPORT_CACHE=%s)", on ? "shared by the surface's wrappers" : "one per wrapper", e ?: "unset"); }
+    return on;
+}
+static void nvmtl_vramc_drop(nvmtl_vramc_ent *gone, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) { nvmtl_vk_buffer_destroy(&gone[i].b); if (gone[i].surf) CFRelease(gone[i].surf); }
+}
+// Under the lock: idle entries past their time leave the table (the caller destroys them after unlocking).
+static unsigned nvmtl_vramc_sweep_locked(uint64_t now, nvmtl_vramc_ent *gone, unsigned max)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < NVMTL_VRAMC_N && n < max; i++) {
+        nvmtl_vramc_ent *e = &g_vramc[i];
+        if (e->surf && !e->refs && now - e->idle_ns > NVMTL_VRAMC_IDLE_NS) { gone[n++] = *e; memset(e, 0, sizeof *e); }
+    }
+    return n;
+}
+static int nvmtl_surface_vram_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
+{
+    const uint32_t id = IOSurfaceGetID(surf);
+    if (!nvmtl_vramc_on()) return nvmtl_vk_surface_vram(id, 0, need, out);
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    nvmtl_vramc_ent gone[8]; unsigned ng;
+    os_unfair_lock_lock(&g_vramc_lock);
+    for (unsigned i = 0; i < NVMTL_VRAMC_N; i++) {
+        nvmtl_vramc_ent *e = &g_vramc[i];
+        if (e->surf && e->id == id && e->need == need) {
+            e->refs++; *out = e->b;
+            ng = nvmtl_vramc_sweep_locked(now, gone, 8);
+            os_unfair_lock_unlock(&g_vramc_lock);
+            nvmtl_vramc_drop(gone, ng);
+            unsigned long long hit = ++g_vramc_hit;
+            if (hit == 1 || hit % 20000 == 0) nvlog("item 7: surface import reused (%llu reused, %llu imported)", hit, (unsigned long long)g_vramc_miss);
+            return 0;
+        }
+    }
+    ng = nvmtl_vramc_sweep_locked(now, gone, 8);
+    os_unfair_lock_unlock(&g_vramc_lock);
+    nvmtl_vramc_drop(gone, ng);
+    if (nvmtl_vk_surface_vram(id, 0, need, out)) return -1;
+    g_vramc_miss++;
+    nvmtl_vramc_ent evicted = {0};
+    os_unfair_lock_lock(&g_vramc_lock);
+    nvmtl_vramc_ent *slot = NULL, *oldest = NULL;
+    for (unsigned i = 0; i < NVMTL_VRAMC_N && !slot; i++) {
+        nvmtl_vramc_ent *e = &g_vramc[i];
+        if (!e->surf) slot = e;
+        else if (!e->refs && (!oldest || e->idle_ns < oldest->idle_ns)) oldest = e;
+    }
+    if (!slot && oldest) { evicted = *oldest; memset(oldest, 0, sizeof *oldest); slot = oldest; }
+    if (slot) { CFRetain(surf); slot->surf = surf; slot->id = id; slot->need = need; slot->b = *out; slot->refs = 1; slot->idle_ns = now; }
+    os_unfair_lock_unlock(&g_vramc_lock);
+    if (evicted.surf) nvmtl_vramc_drop(&evicted, 1);
+    return 0;   // with no free slot the import stays uncached; nvmtl_surface_vram_put destroys it directly
+}
+static void nvmtl_surface_vram_put(nvk_buffer *b)
+{
+    if (!b || !b->buf) return;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    nvmtl_vramc_ent gone[8]; unsigned ng; int found = 0;
+    os_unfair_lock_lock(&g_vramc_lock);
+    for (unsigned i = 0; i < NVMTL_VRAMC_N; i++) {
+        nvmtl_vramc_ent *e = &g_vramc[i];
+        if (e->surf && e->refs && e->b.buf == b->buf) { if (!--e->refs) e->idle_ns = now; found = 1; break; }
+    }
+    ng = nvmtl_vramc_sweep_locked(now, gone, 8);
+    os_unfair_lock_unlock(&g_vramc_lock);
+    nvmtl_vramc_drop(gone, ng);
+    if (!found) nvmtl_vk_buffer_destroy(b);
+    memset(b, 0, sizeof *b);
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -1161,7 +1273,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
-            if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
+            if (!nvmtl_surface_vram_get(surf, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
@@ -1172,7 +1284,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
                     return 0;
                 }
-                nvmtl_vk_buffer_destroy(&vb);
+                nvmtl_surface_vram_put(&vb);
             }
         }
     }
@@ -1551,8 +1663,12 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     return mine;
 }
 - (void)newLibraryWithSource:(NSString *)src options:(MTLCompileOptions *)opt completionHandler:(MTLNewLibraryCompletionHandler)h {
-    NSError *e = nil; id<MTLLibrary> lib = [self newLibraryWithSource:src options:opt error:&e];
-    if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(lib, e); });
+    NSString *source = [src copy];
+    MTLCompileOptions *options = [opt copy];
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        NSError *e = nil; id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&e];
+        if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(lib, e); });
+    }}];
 }
 - (id)targetDeviceArchitecture {
     static id arch; static dispatch_once_t once;
@@ -1718,6 +1834,11 @@ static void nvmtl_pipeline_key_log(id f, const char *stage, const void *pipe)
 {
     if (![f isKindOfClass:[NVMTLFunction class]]) return;
     NVMTLFunction *fn = f; static char kKey;
+#if NVMTL_RELEASE
+    // The line is written only for a process that opted in; without that, the SHA-256 of the whole AIR text was
+    // computed for every new specialized function and thrown away (6% of a VideoToolbox transfer).
+    if (!nvmtl_process_env_on()) return;
+#endif
     if (objc_getAssociatedObject(fn, &kKey)) return;
     objc_setAssociatedObject(fn, &kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     const uint32_t x = nvmtl_function_spv_fnv(fn);

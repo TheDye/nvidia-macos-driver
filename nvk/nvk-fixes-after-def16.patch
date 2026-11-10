@@ -1,6 +1,6 @@
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
-@@ -244,12 +244,12 @@
+@@ -256,13 +256,13 @@
     }
     const int64_t seen = nvrm_xnu_wait_event(fd, 0, 0);   /* the count BEFORE the re-check */
     if (seen < 0) {
@@ -14,17 +14,19 @@
 +   { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: event wait ON - waits sleep on graphics completion events (fd %d)\n", fd); }
     if (!nvrm_evwait_pending(n, slot, gen, want, &fd) || fd < 0)
        return;
+    __atomic_fetch_add(&nvrm_wait_stats[0], 1, __ATOMIC_RELAXED);
     (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
-@@ -275,7 +275,7 @@
+@@ -288,8 +288,8 @@
     }
     if (__atomic_load_n(sem, __ATOMIC_ACQUIRE) >= want)
        return true;
 -   { static int said; if (!said++) fprintf(stderr, "nvrm: b73 flush waits sleep on the device's graphics event (fd %d)\n", fd); }
 +   { static int said; if (!said++ && nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: flush waits sleep on the device's graphics event (fd %d)\n", fd); }
+    __atomic_fetch_add(&nvrm_wait_stats[0], 1, __ATOMIC_RELAXED);
     (void)nvrm_xnu_wait_event(fd, (uint32_t)seen, 2000);
     return true;
  }
-@@ -714,11 +714,11 @@
+@@ -728,11 +728,11 @@
                 }
              }
           } else {
@@ -38,7 +40,7 @@
           ctx->hTsg = 0;
        }
     }
-@@ -736,12 +736,12 @@
+@@ -750,12 +750,12 @@
     {
        NV_STATUS chs = nvRmApiAlloc(&rm, chanParent, &ctx->hChannel, pdev->channelClass, &createChannelParams);
        if (chs != NV_OK && createChannelParams.flags) {   /* PRIVILEGED refused: 610's flag, retried plain */
@@ -53,7 +55,7 @@
           ctx->ceOnly = false; engineType = NV2080_ENGINE_TYPE_GRAPHICS; createChannelParams.engineType = engineType; ctx->hChannel = 0;
           chs = nvRmApiAlloc(&rm, chanParent, &ctx->hChannel, pdev->channelClass, &createChannelParams);
        }
-@@ -790,13 +790,19 @@
+@@ -804,13 +804,19 @@
     if (cs != NV_OK && !ctx->ceOnly) {
        NV2080_CTRL_GPU_GET_ENGINE_PARTNERLIST_PARAMS pl = { .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
                                                             .partnershipClassId = pdev->base.dev_info.cls_copy, .runqueue = 0 };
@@ -77,7 +79,7 @@
     }
     NV_CHECK(cs);
     if (!ctx->ceOnly) {   /* b81: a copy-engine channel carries the copy class only (610 trace 242-246) */
-@@ -889,15 +895,15 @@
+@@ -903,15 +909,15 @@
        NV2080_CTRL_GR_GET_CTXSW_MODES_PARAMS after = { .hChannel = ctx->hChannel };
        NV_STATUS gs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_GR_GET_CTXSW_MODES, &after, sizeof after);
        if (ps != NV_OK || gs != NV_OK || after.cilpPreemptMode != NV2080_CTRL_SET_CTXSW_PREEMPTION_MODE_COMPUTE_CTA || nvmtl_cfg_getenv("NVK_PREEMPT_LOG"))
@@ -96,7 +98,7 @@
     }
     if (!ctx->ceOnly && nvrm610_on("ZCULL")) {
        /* b81 trace 322: a zcull context buffer bound SEPARATE_BUFFER (hierarchical Z survives a context switch).
-@@ -912,14 +918,14 @@
+@@ -926,14 +932,14 @@
                                                            .zcullMode = NV2080_CTRL_CTXSW_ZCULL_MODE_SEPARATE_BUFFER };
              NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND, &zb, sizeof zb);
              if (bs != NV_OK || nvmtl_cfg_getenv("NVK_PREEMPT_LOG"))
@@ -114,7 +116,7 @@
                ctx->ceOnly ? "COPY-ENGINE" : "graphics", (unsigned)ctx->hTsg, (unsigned)ctx->hCtxShare, (unsigned)engineType);
  
     /* b73 (patch_evdev.py): NO per-channel non-stall event. WAS one GRAPHICS event per channel (copy-engine ones too)
-@@ -951,7 +957,7 @@
+@@ -965,7 +971,7 @@
  {
     VkResult r = nvkmd_nvrm_create_exec_ctx_on(_dev, log_obj, engines, true, ctx_out);
     if (r != VK_SUCCESS && engines == NVKMD_ENGINE_COPY && nvrm610_on("CECHAN")) {
