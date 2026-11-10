@@ -865,3 +865,16 @@ with tempfile.TemporaryDirectory() as d:
             assert all(result.returncode == 0 for result in results), 'production hot-path formatting regression'
         else:
             subprocess.run([str(executable)], check=True)
+
+# WindowServer hot paths (2026-11-10 sample): a release plugin must not describe the pixel-sampler dictionary for a log
+# line it does not write, and a sampler set already serialized in one encoder must not be serialized again in the next.
+_dev = (ROOT / 'plugin/NVMTLDevice.m').read_text()
+_i = _dev.index('nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);')
+assert 'if (nvmtl_process_env_on())' in _dev[_i - 300:_i], 'pixel sampler description formatted in release processes'
+_obj = (ROOT / 'plugin/NVMTLObjects.m').read_text()
+_m = _obj[_obj.index('- (NVMTLRenderPipelineState *)nvmtlSamplerPipeline {'):]
+_m = _m[:_m.index('NSData *key=_pixelSamplerKey;')]
+assert 'globalKeys' in _m and _m.index('globalKeys') < _m.index('dataWithJSONObject'), 'process-wide pixel sampler key list missing'
+assert _m.count('os_unfair_lock_lock(&globalLock)') == 2 and _m.count('os_unfair_lock_unlock(&globalLock)') == 2, 'global key list not locked'
+assert 'globalKeys.count == 32' in _m, 'global key list must stay bounded'
+print('ok: WindowServer sampler hot paths')

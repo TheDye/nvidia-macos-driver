@@ -2220,6 +2220,11 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN((NSUInteger)sd.borderColor,2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
+        // CoreDisplay makes a sampler every display-pipe commit: describing the dictionary cost WindowServer 62 of the
+        // 75 samples this method took, for a line a release plugin only writes in a process that opted into its log.
+#if NVMTL_RELEASE
+        if (nvmtl_process_env_on())
+#endif
         nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);

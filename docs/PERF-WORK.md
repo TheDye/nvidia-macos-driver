@@ -255,3 +255,10 @@ dealloc, and each alias image re-queried immutable format properties.
 - Remaining WindowServer cost under that workload (8 s `sample`): `commitAndWaitUntilSubmitted`/`waitUntilScheduled`
   blocking in CA's flush, per-draw `nvk_AllocateDescriptorSets` (the default-off `NVMTL_SNAPSHOT_REUSE` targets it), and a
   spinning `nvkmd_nvrm_wait_backoff` in the pump thread's fence wait (inside NVK; needs a Mesa rebuild).
+
+
+## WindowServer hot spots after the 128-slot reboot (2026-11-10)
+
+- `sample WindowServer 8` under `tools/ws_anim_workload` at 164.875 Hz: surface-in (CPU-drawn window upload) 838 samples, of which ~385 wait for the GPU copy and ~180 are the CPU copy; per-draw `nvk_AllocateDescriptorSets` 138; `newSamplerStateWithDescriptor:` 75 (62 in `NSDictionary description`); `NSJSONSerialization` under `nvmtlSamplerPipeline` 26.
+- Surface-in A/B in a normal process (4 changing 1280x800 surfaces, pixel-checked): imported pages + wait 2.6 ms/frame, memcpy + async 2.5–2.8 ms/frame, encode-time blocking 2.8 ms both: bandwidth bound, so async uploads (#476) would not cut CPU; skipped.
+- Fixed: the sampler description (24–26 → 1.4–2.0 µs/sampler) and the per-encoder JSON key (pixel-sampler frame 0.31–0.33 → 0.22–0.25 ms CPU). WindowServer takes effect after reboot.

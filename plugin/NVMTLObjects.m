@@ -3693,9 +3693,33 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             for (NSArray *entry in _pixelSamplerKeys) {
                 if ([entry[0] isEqual:vertex] && [entry[1] isEqual:fragment]) { _pixelSamplerKey=entry[2]; break; }
             }
+            // Encoders are per frame, so their 8-entry list starts empty every frame and each one serialized the same
+            // sampler sets to JSON again (WindowServer: NSJSONSerialization under every first draw). The same sets map
+            // to the same key in every encoder; a small process-wide list remembers them.
+            static os_unfair_lock globalLock = OS_UNFAIR_LOCK_INIT; static NSMutableArray *globalKeys;
+            if (!_pixelSamplerKey) {
+                os_unfair_lock_lock(&globalLock);
+                for (NSArray *entry in globalKeys) {
+                    if ([entry[0] isEqual:vertex] && [entry[1] isEqual:fragment]) { _pixelSamplerKey=entry[2]; break; }
+                }
+                os_unfair_lock_unlock(&globalLock);
+                if (_pixelSamplerKey) {
+                    if (!_pixelSamplerKeys) _pixelSamplerKeys=[NSMutableArray new];
+                    if (_pixelSamplerKeys.count == 8) [_pixelSamplerKeys removeObjectAtIndex:0];
+                    [_pixelSamplerKeys addObject:@[[vertex copy],[fragment copy],_pixelSamplerKey]];
+                }
+            }
             if (!_pixelSamplerKey) {
                 vS=nvmtl_pixel_sampler_norm(vertex); fS=nvmtl_pixel_sampler_norm(fragment);
                 _pixelSamplerKey=[NSJSONSerialization dataWithJSONObject:@[vS,fS] options:NSJSONWritingSortedKeys error:NULL];
+                if (_pixelSamplerKey) {
+                    NSArray *entry=@[[vertex copy],[fragment copy],_pixelSamplerKey];
+                    os_unfair_lock_lock(&globalLock);
+                    if (!globalKeys) globalKeys=[NSMutableArray new];
+                    if (globalKeys.count == 32) [globalKeys removeObjectAtIndex:0];
+                    [globalKeys addObject:entry];
+                    os_unfair_lock_unlock(&globalLock);
+                }
                 if (!_pixelSamplerKeys) _pixelSamplerKeys=[NSMutableArray new];
                 if (_pixelSamplerKeys.count == 8) [_pixelSamplerKeys removeObjectAtIndex:0];
                 [_pixelSamplerKeys addObject:@[[vertex copy],[fragment copy],_pixelSamplerKey]];

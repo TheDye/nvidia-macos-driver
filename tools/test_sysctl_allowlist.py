@@ -24,7 +24,10 @@ WRITABLE = {"nvaccel_igpu", "nvaccel_iop", "nvaccelfb", "nvaccel_vm_sticky", "nv
             # Reviewed 2.7.2: the display-link switch the boot guard manages, and the Intel panel's test attach. Both root-only.
             "nvrmfb_agdc_k5", "nmintelfb_attach",
             # Default ON, root-writable: private synchronous pure-flip landing wait outside the display gate (0 = gated).
-            "nvrmfb_flip_ungated"}
+            "nvrmfb_flip_ungated",
+            # Upstream PR #467, default OFF here, root-only: accelerator-lock handling during a bounded page-off wait;
+            # exposes no memory and keeps the ownership check before unlocking.
+            "nvaccel_pageoff_unlocked_wait"}
 # Read-only diagnostics that print physical addresses or memory: registered only with boot-arg nvrmdiag=1, root only.
 PHYSICAL = {"nvrm_watchpage", "nvrm_physmap", "nvrm_pvsentinel", "nvrm_winwhy", "nvrm_pvchain", "nvrm_winraw"}
 DECL = re.compile(r"SYSCTL_(?:INT|UINT|QUAD|PROC|STRING|OPAQUE|LONG|ULONG)\s*\(\s*_debug\s*,\s*OID_AUTO\s*,\s*(\w+)\s*,(.*?)\)\s*;", re.S)

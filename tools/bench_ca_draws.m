@@ -135,7 +135,11 @@ int main(int argc, char **argv) { @autoreleasepool {
         for (int y = 0; y < 256; y++) [t replaceRegion:MTLRegionMake2D(0, y, 256, 1) mipmapLevel:0 withBytes:row bytesPerRow:1024];
         [tx addObject:t];
     }
+    // BENCH_PIXEL_SAMPLER=1: pixel-coordinate samplers, plus one new sampler state per frame, as CoreDisplay makes on every
+    // display-pipe commit (exercises the pixel-sampler specialization key and newSamplerStateWithDescriptor:).
+    const int pixel = getenv("BENCH_PIXEL_SAMPLER") && !strcmp(getenv("BENCH_PIXEL_SAMPLER"), "1");
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.normalizedCoordinates = !pixel;
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;  id<MTLSamplerState> linear = [d newSamplerStateWithDescriptor:sd];
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest; id<MTLSamplerState> nearest = [d newSamplerStateWithDescriptor:sd];
     MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -159,6 +163,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             id<MTLCommandBuffer> cb = [q commandBuffer];
             id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
             [en setRenderPipelineState:ps];
+            if (pixel) { id<MTLSamplerState> perFrame = [d newSamplerStateWithDescriptor:sd]; if (!perFrame) return 9; [en setFragmentSamplerState:perFrame atIndex:0]; }
             for (int k = 0; k < draws; k++) {
                 float r[4] = { -1 + (k % 12) * 0.16f, -1 + (k / 12) * 0.18f, -0.85f + (k % 12) * 0.16f, -0.83f + (k / 12) * 0.18f };
                 [en setVertexBytes:r length:sizeof r atIndex:0];
@@ -177,8 +182,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         [last waitUntilCompleted];
         if (pass) {
             const double c = cpu_s() - c0, w = CFAbsoluteTimeGetCurrent() - w0;
-            printf("RESULT plugin=%s CF=%s frames=%d draws/frame=%d cpu_ms/frame=%.6f us/draw=%.4f wall_ms/frame=%.6f wall_us/draw=%.4f fps=%.1f status=%ld\n",
-                   argv[1], getenv("NVMTL_RESSET_CF") ?: "unset", frames, draws, c * 1000 / frames,
+            printf("RESULT plugin=%s pixel=%d CF=%s frames=%d draws/frame=%d cpu_ms/frame=%.6f us/draw=%.4f wall_ms/frame=%.6f wall_us/draw=%.4f fps=%.1f status=%ld\n",
+                   argv[1], pixel, getenv("NVMTL_RESSET_CF") ?: "unset", frames, draws, c * 1000 / frames,
                    c * 1e6 / ((double)frames * draws), w * 1000 / frames, w * 1e6 / ((double)frames * draws), frames / w, (long)last.status);
             if (last.status != MTLCommandBufferStatusCompleted) return 8;
             int verified = verify_pixels(d,q,rt,frames-1,draws);
