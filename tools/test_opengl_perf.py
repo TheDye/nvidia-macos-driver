@@ -878,3 +878,19 @@ assert 'globalKeys' in _m and _m.index('globalKeys') < _m.index('dataWithJSONObj
 assert _m.count('os_unfair_lock_lock(&globalLock)') == 2 and _m.count('os_unfair_lock_unlock(&globalLock)') == 2, 'global key list not locked'
 assert 'globalKeys.count == 32' in _m, 'global key list must stay bounded'
 print('ok: WindowServer sampler hot paths')
+
+# App start: the translator's cache identity comes from its mapped code signature, not a 15 MB file hash per process,
+# with the file hash kept as the fallback; pool blocks are cleared as they are handed out, never left uncleared.
+_ld = (ROOT / 'plugin/NVMTLLibraryLoad.m').read_text()
+_r = _ld[_ld.index('static int nvmtl_xlate_ready(void) {'):]
+assert 'if (h && !nvmtl_translator_sig_tag(dlsym(h, "nvmtl_translate"), gXlateTag, sizeof gXlateTag))' in _r, 'translator tag still hashes the file first'
+assert 'nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);' in _r, 'file-hash fallback missing'
+_t = _ld[_ld.index('static int nvmtl_translator_sig_tag('):_ld.index('typedef int (*nvmtl_sampler_fn)')]
+for need in ('0xfade0cc0u', 'len > cs->datasize', 'cs->dataoff < linkedit->fileoff', 'text->fileoff != 0', '"cs256-%s"'):
+    assert need in _t, 'signature tag bound check missing: ' + need
+_vk = (ROOT / 'plugin/nvmtl_vk.c').read_text()
+_c = _vk[_vk.index('static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)'):]
+_c = _c[:_c.index('\n}\n') + 3]
+assert _c.index('pool_block_clear_to(blk, off + len + nvmtl_buf_guard());') < _c.index('nvmtl_vk_buffer_create_placed('), 'pool range must be cleared before a buffer is placed on it'
+assert 'nvmtl_vk_heap_zero(&nb->heap' in _c and 'nb->zeroed = nb->heap.size' in _c, 'unmapped/disabled blocks keep the eager path'
+print('ok: app-start translator tag and lazy pool clear')

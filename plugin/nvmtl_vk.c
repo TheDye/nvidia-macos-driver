@@ -10488,6 +10488,7 @@ typedef struct { size_t off, len; } pool_range;
 typedef struct pool_block {
     struct pool_block *next; nvk_heap heap; size_t used; uint32_t nlive;
     int vram;
+    size_t zeroed;   /* mapped blocks: bytes [0, zeroed) are cleared (pool_block_clear_to) */
     pool_range *fr; uint32_t nfr, cfr;
 } pool_block;
 static pool_block *g_pool;
@@ -10579,6 +10580,18 @@ static int vpool_heap_create(size_t size, nvk_heap *out)
     g_alloc_bytes += size; g_bar1_bytes += size;
     return 0;
 }
+// A mapped pool block is cleared as it is handed out instead of all at once: the whole 32 MiB host memset (first touch of
+// every page) cost 17 ms of the first pipeline a process made (bench_metal_load, 41 ms in ensure_descriptors_locked).
+// Bytes are cleared before any buffer, or the guard behind it, can see them, so no placement ever reads what the
+// allocator left; ranges given back and taken again were cleared on their first take, as with the eager clear.
+static void pool_block_clear_to(pool_block *blk, size_t end)
+{
+    if (!blk->heap.map || end <= blk->zeroed) return;
+    if (end > blk->heap.size) end = blk->heap.size;
+    size_t to = (end + (1u << 20) - 1) & ~(size_t)((1u << 20) - 1);   /* whole MiBs: fewer, larger clears */
+    if (to > blk->heap.size) to = blk->heap.size;
+    if (to > blk->zeroed) { memset((uint8_t *)blk->heap.map + blk->zeroed, 0, to - blk->zeroed); blk->zeroed = to; }
+}
 static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
 {
     size_t al = pool_align(), len = (size + al - 1) / al * al; if (!len) len = al;
@@ -10590,12 +10603,16 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
         pool_block *nb = calloc(1, sizeof *nb);
         if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
         nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
-        nvmtl_vk_heap_zero(&nb->heap, vram ? "buffer pool (VRAM through BAR1)" : "buffer pool");   // mapped: a host memset, no submit under the pool lock
+        if (!nb->heap.map || !nvmtl_heap_zero_on() || g_state != 1)   // a mapped block is cleared as it is taken (pool_block_clear_to)
+            nvmtl_vk_heap_zero(&nb->heap, vram ? "buffer pool (VRAM through BAR1)" : "buffer pool");
+        else nb->zeroed = 0;
+        if (nb->heap.map && (!nvmtl_heap_zero_on() || g_state != 1)) nb->zeroed = nb->heap.size;
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
               nb->heap.memtype, (unsigned long long)g_pool_live, (unsigned long long)g_pool_bytes);
         blk = nb; if (!pool_block_take(blk, len, &off)) { pthread_mutex_unlock(&g_pool_lock); return -1; }
     }
+    pool_block_clear_to(blk, off + len + nvmtl_buf_guard());
     blk->nlive++; g_pool_live++; g_pool_bytes += len;
     pthread_mutex_unlock(&g_pool_lock);
     nvk_buffer pb; memset(&pb, 0, sizeof pb);

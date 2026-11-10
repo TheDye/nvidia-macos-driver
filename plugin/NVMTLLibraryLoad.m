@@ -18,6 +18,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <os/lock.h>
+#include <mach-o/loader.h>
+#include <libkern/OSByteOrder.h>
 extern char **environ;
 
 void nvlog(const char *fmt, ...);
@@ -82,6 +84,43 @@ static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capac
         nvlog("translator cache: content read failed; using process-private identity");
     }
 }
+// The translator's identity from its loaded image instead of its 15 MB file: hashing the file cost every process that
+// loads a library ~48 ms on the main thread (bench_metal_load: 55 ms of a 66 ms newLibraryWithSource). The image's code
+// signature already holds a SHA-256 of every page of the file (any byte change that still loads re-signs it), so a
+// SHA-256 of that signature blob, read from the mapped __LINKEDIT with no file I/O, names the same build as the file hash
+// did. An unsigned image, or one whose signature cannot be located in bounds, keeps the file hash.
+static int nvmtl_translator_sig_tag(const void *anySymbol, char *tag, size_t capacity) {
+    Dl_info info;
+    if (!anySymbol || !dladdr(anySymbol, &info) || !info.dli_fbase) return 0;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+    if (mh->magic != MH_MAGIC_64 || mh->sizeofcmds > (1u << 20)) return 0;
+    const uint8_t *lc = (const uint8_t *)(mh + 1), *end = lc + mh->sizeofcmds;
+    const struct segment_command_64 *text = NULL, *linkedit = NULL; const struct linkedit_data_command *cs = NULL;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc + sizeof(struct load_command) > end) return 0;
+        const struct load_command *c = (const struct load_command *)lc;
+        if (c->cmdsize < sizeof *c || lc + c->cmdsize > end) return 0;
+        if (c->cmd == LC_SEGMENT_64 && c->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *s = (const struct segment_command_64 *)c;
+            if (!strncmp(s->segname, "__TEXT", 16)) text = s;
+            else if (!strncmp(s->segname, "__LINKEDIT", 16)) linkedit = s;
+        } else if (c->cmd == LC_CODE_SIGNATURE && c->cmdsize >= sizeof(struct linkedit_data_command)) cs = (const struct linkedit_data_command *)c;
+        lc += c->cmdsize;
+    }
+    if (!text || !linkedit || !cs || !cs->datasize || text->fileoff != 0) return 0;
+    if (cs->dataoff < linkedit->fileoff || (uint64_t)cs->dataoff + cs->datasize > linkedit->fileoff + linkedit->filesize) return 0;
+    const uintptr_t slide = (uintptr_t)mh - (uintptr_t)text->vmaddr;
+    const uint8_t *blob = (const uint8_t *)(slide + linkedit->vmaddr + (cs->dataoff - linkedit->fileoff));
+    // a code-signature SuperBlob: magic 0xfade0cc0, big-endian length no larger than the load command says
+    if (OSSwapBigToHostInt32(((const uint32_t *)blob)[0]) != 0xfade0cc0u) return 0;
+    const uint32_t len = OSSwapBigToHostInt32(((const uint32_t *)blob)[1]);
+    if (len < 12 || len > cs->datasize) return 0;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(blob, (CC_LONG)len, digest);
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (size_t i = 0; i < sizeof digest; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
+    snprintf(tag, capacity, "cs256-%s", hex);
+    return 1;
+}
 typedef int (*nvmtl_sampler_fn)(const char *, const char *, const char *, uint8_t **, size_t *, char *, size_t);
 static nvmtl_sampler_fn xlate_sampler;
 typedef void (*nvmtl_tglen_fn)(const uint32_t *, uint32_t);
@@ -117,7 +156,8 @@ static int nvmtl_xlate_ready(void) {
             bundled = [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"libnvmtl_translate.dylib"];
         const char *xpath = bundled && access(bundled.fileSystemRepresentation,R_OK)==0 ? bundled.fileSystemRepresentation : NVMTL_XLATE_LIB;
         void *h = dlopen(xpath, RTLD_NOW | RTLD_LOCAL);
-        if (h) nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);
+        if (h && !nvmtl_translator_sig_tag(dlsym(h, "nvmtl_translate"), gXlateTag, sizeof gXlateTag))
+            nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);
         strlcpy(gXlateBuildTag, gXlateTag, sizeof gXlateBuildTag);
         // Each mode below changes the SPIR-V a module translates to, so a cache entry written in one mode must never be
         // served in another: unrolled AIR, canonical pointers, argument-buffer samplers, and the two translator switches

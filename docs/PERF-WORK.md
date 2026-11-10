@@ -262,3 +262,10 @@ dealloc, and each alias image re-queried immutable format properties.
 - `sample WindowServer 8` under `tools/ws_anim_workload` at 164.875 Hz: surface-in (CPU-drawn window upload) 838 samples, of which ~385 wait for the GPU copy and ~180 are the CPU copy; per-draw `nvk_AllocateDescriptorSets` 138; `newSamplerStateWithDescriptor:` 75 (62 in `NSDictionary description`); `NSJSONSerialization` under `nvmtlSamplerPipeline` 26.
 - Surface-in A/B in a normal process (4 changing 1280x800 surfaces, pixel-checked): imported pages + wait 2.6 ms/frame, memcpy + async 2.5–2.8 ms/frame, encode-time blocking 2.8 ms both: bandwidth bound, so async uploads (#476) would not cut CPU; skipped.
 - Fixed: the sampler description (24–26 → 1.4–2.0 µs/sampler) and the per-encoder JSON key (pixel-sampler frame 0.31–0.33 → 0.22–0.25 ms CPU). WindowServer takes effect after reboot.
+
+
+## App start and third reboot (2026-11-10)
+
+- WindowServer 165 Hz workload after the sampler fixes: 3.86/3.94 ms CPU per output update, 71–72% of one core, p95 callback 9.7 ms; the remaining driver cost is spread (per-draw descriptor set write/allocate, sampler pipeline bind, embedded bindings), no single hot spot.
+- `bench_metal_load` sampled through a suspended-spawn launcher: device 48–57 ms (NVK device/channel creation 15 ms, plugin load 12 ms, IOSurface GPU policy 9 ms), library 60 ms of which 48 ms was the translator file SHA-256, pipeline 41 ms in descriptor setup of which 17 ms was the pool memset.
+- After: library 3–5 ms, first render 112–139 ms vs 179–196 ms (5/5 pairs), shader cache still hits across processes (second run of a new shader 312 → 5 ms).
