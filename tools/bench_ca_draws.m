@@ -20,7 +20,7 @@
 
 // Read back the final frame outside the timing interval. Every visible quad has a
 // known opaque colour; checking each centre catches stale texture/table snapshots.
-static int verify_pixels(id<MTLDevice> d, id<MTLCommandQueue> q, id<MTLTexture> rt, int frame, int draws) {
+static int verify_pixels(id<MTLDevice> d, id<MTLCommandQueue> q, id<MTLTexture> rt, int frame, int draws, BOOL unused) {
     const NSUInteger stride = 1920 * 4;
     id<MTLBuffer> readback = [d newBufferWithLength:stride * 1080 options:MTLResourceStorageModeShared];
     if (!readback) return 11;
@@ -37,8 +37,8 @@ static int verify_pixels(id<MTLDevice> d, id<MTLCommandQueue> q, id<MTLTexture> 
         float x = -0.925f + (k % 12) * 0.16f, y = -0.915f + (k / 12) * 0.18f;
         if (x <= -1 || x >= 1 || y <= -1 || y >= 1) continue;
         unsigned px = (unsigned)((x + 1) * 960), py = (unsigned)((1 - y) * 540);
-        uint32_t a = 0xff000000u | (uint32_t)(((k + frame) % 48) * 5000);
-        uint32_t b = 0xff000000u | (uint32_t)(((k * 7 + frame) % 48) * 5000);
+        uint32_t a = 0xff000000u | (uint32_t)((((unused ? 0 : k) + frame) % 48) * 5000);
+        uint32_t b = 0xff000000u | (uint32_t)((((unused ? 0 : k * 7) + frame) % 48) * 5000);
         for (unsigned channel = 0; channel < 4; channel++) {
             int expected = (int)lround((((a >> (channel*8)) & 255) + ((b >> (channel*8)) & 255)) * 0.5);
             int actual = pixels[py*stride + px*4 + channel];
@@ -95,6 +95,42 @@ static int bench_resset(int argc, char **argv) {
     return 0;
 }
 
+static int verify_storage_boundaries(id<MTLDevice> d) {
+    const unsigned slots[] = {62, 63, 127}; // storage bindings 255, 256 and 320
+    id<MTLCommandQueue> q = [d newCommandQueue];
+    for (unsigned k=0; k<sizeof slots/sizeof slots[0]; k++) {
+        NSString *src=[NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal; kernel void high(texture2d<float,access::write> out [[texture(%u)]], constant float4 &c [[buffer(0)]], uint2 p [[thread_position_in_grid]]){out.write(c,p);}",slots[k]];
+        NSError *e=nil;id<MTLLibrary> l=[d newLibraryWithSource:src options:nil error:&e];
+        id<MTLComputePipelineState> ps=l ? [d newComputePipelineStateWithFunction:[l newFunctionWithName:@"high"] error:&e] : nil;
+        if (!ps) { NSLog(@"storage slot %u: %@",slots[k],e); return 20; }
+        MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+        td.storageMode=MTLStorageModePrivate;td.usage=MTLTextureUsageShaderWrite|MTLTextureUsageShaderRead;
+        id<MTLTexture> a=[d newTextureWithDescriptor:td], b=[d newTextureWithDescriptor:td];
+        if (!a || !b) return 21;
+        id<MTLCommandBuffer> cb=[q commandBuffer];id<MTLComputeCommandEncoder> en=[cb computeCommandEncoder];
+        [en setComputePipelineState:ps];
+        const float colors[3][4]={{1,0,0,1},{0,1,0,1},{0,0,1,1}};
+        for (unsigned i=0;i<3;i++) {
+            [en setBytes:colors[i] length:16 atIndex:0];[en setTexture:i==1?b:a atIndex:slots[k]];
+            [en dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(4,4,1)];
+        }
+        [en endEncoding];
+        id<MTLBuffer> pixels=[d newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+        [bl copyFromTexture:a sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(4,4,1) toBuffer:pixels destinationOffset:0 destinationBytesPerRow:16 destinationBytesPerImage:64];
+        [bl copyFromTexture:b sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(4,4,1) toBuffer:pixels destinationOffset:64 destinationBytesPerRow:16 destinationBytesPerImage:64];
+        [bl endEncoding];[cb commit];[cb waitUntilCompleted];
+        if (cb.status!=MTLCommandBufferStatusCompleted) return 22;
+        const uint8_t *v=pixels.contents;
+        for (unsigned i=0;i<32;i++) for(unsigned c=0;c<4;c++) {
+            unsigned expected=(c==3 || c==(i<16?2:1))?255:0;
+            if(v[i*4+c]!=expected) { fprintf(stderr,"storage slot %u readback pixel %u channel %u: %u != %u\n",slots[k],i,c,v[i*4+c],expected);return 23; }
+        }
+        printf("STORAGE slot=%u pixels=32 A-B-A=verified\n",slots[k]);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
     if (argc < 2) { fprintf(stderr, "usage: %s <NVMTLDriver> [frames] [draws]\n", argv[0]); return 2; }
     if (!dlopen(argv[1], RTLD_NOW | RTLD_LOCAL)) { fprintf(stderr, "%s\n", dlerror()); return 3; }
@@ -105,6 +141,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                                                                      NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
     IOObjectRelease(svc);
     if (!d) { fprintf(stderr, "NVMTLDevice init failed\n"); return 5; }
+    if (argc > 2 && !strcmp(argv[2], "--storage-bounds")) return verify_storage_boundaries(d);
 
     NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
         "struct V { float4 p [[position]]; float2 t; };\n"
@@ -148,6 +185,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     id<MTLTexture> rt = [d newTextureWithDescriptor:rd];
     id<MTLCommandQueue> q = [d newCommandQueue];
 
+    // Exercise descriptor invalidation by a slot the current shader does not read. The live slots stay fixed per frame.
+    const BOOL unused = getenv("BENCH_UNUSED_BINDINGS") && !strcmp(getenv("BENCH_UNUSED_BINDINGS"), "1");
     const int frames = argc > 2 ? atoi(argv[2]) : 600, draws = argc > 3 ? atoi(argv[3]) : 120;
     if (frames <= 0 || draws <= 0) return 2;
     for (int pass = 0; pass < 2; pass++) {          // pass 0 warms pipelines and caches
@@ -167,9 +206,10 @@ int main(int argc, char **argv) { @autoreleasepool {
             for (int k = 0; k < draws; k++) {
                 float r[4] = { -1 + (k % 12) * 0.16f, -1 + (k / 12) * 0.18f, -0.85f + (k % 12) * 0.16f, -0.83f + (k / 12) * 0.18f };
                 [en setVertexBytes:r length:sizeof r atIndex:0];
-                [en setFragmentTexture:tx[(k + f) % NT] atIndex:0];
-                [en setFragmentTexture:tx[(k * 7 + f) % NT] atIndex:1];
-                [en setFragmentSamplerState:(k & 1) ? linear : nearest atIndex:0];
+                [en setFragmentTexture:tx[((unused ? 0 : k) + f) % NT] atIndex:0];
+                [en setFragmentTexture:tx[((unused ? 0 : k * 7) + f) % NT] atIndex:1];
+                if (unused) [en setFragmentTexture:tx[(k + f) % NT] atIndex:7];
+                [en setFragmentSamplerState:(!unused && (k & 1)) ? linear : nearest atIndex:0];
                 [en drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             }
             [en endEncoding]; [cb commit];
@@ -182,11 +222,11 @@ int main(int argc, char **argv) { @autoreleasepool {
         [last waitUntilCompleted];
         if (pass) {
             const double c = cpu_s() - c0, w = CFAbsoluteTimeGetCurrent() - w0;
-            printf("RESULT plugin=%s pixel=%d CF=%s frames=%d draws/frame=%d cpu_ms/frame=%.6f us/draw=%.4f wall_ms/frame=%.6f wall_us/draw=%.4f fps=%.1f status=%ld\n",
-                   argv[1], pixel, getenv("NVMTL_RESSET_CF") ?: "unset", frames, draws, c * 1000 / frames,
+            printf("RESULT plugin=%s pixel=%d unused=%d CF=%s frames=%d draws/frame=%d cpu_ms/frame=%.6f us/draw=%.4f wall_ms/frame=%.6f wall_us/draw=%.4f fps=%.1f status=%ld\n",
+                   argv[1], pixel, unused, getenv("NVMTL_RESSET_CF") ?: "unset", frames, draws, c * 1000 / frames,
                    c * 1e6 / ((double)frames * draws), w * 1000 / frames, w * 1e6 / ((double)frames * draws), frames / w, (long)last.status);
             if (last.status != MTLCommandBufferStatusCompleted) return 8;
-            int verified = verify_pixels(d,q,rt,frames-1,draws);
+            int verified = verify_pixels(d,q,rt,frames-1,draws,unused);
             if (verified) return verified;
         }
     }

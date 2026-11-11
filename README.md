@@ -26,6 +26,15 @@ Support the work: https://buymeacoffee.com/nullmoth
 | Metal | Metal 3: argument buffers tier 2, ray tracing, mesh shaders, MPS, MetalFX path |
 | Also | OpenGL (through Apple's GL-on-Metal), OpenCL, Core Image, Core ML |
 
+## Local performance patches in this fork
+
+This fork layers local source patches on upstream **2.8.1**; it is not an official NullMoth release. The descriptor/storage
+fixes are installed and tested on RTX 4060 Ti / macOS 26.7.2. Automated checks pass, but display timeouts and variable
+compositor latency remain observed: **not a universal production or flicker-free 165 Hz certification**.
+See [validation and limits](docs/PERF-WORK.md), [install/rollback notes](dist/INSTALL-LOCAL-PATCHED.md), and the
+[source patch archive](dist/nullmoth-2.8.1-local-patches.tar.gz). The 241 MB prebuilt binary archive is a local deliverable,
+not included in git or published as a GitHub Release. Do not expect a git clone to contain its complete binary pkgroot.
+
 ## How it works
 
 ```

@@ -364,7 +364,7 @@ static nvk_buffer g_dummyBuf={.buf=(void *)1,.size=256};
 typedef struct {
     nvmtl_slot s[2][NVMTL_NBIND];
     uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2];
-    uint64_t lastw[2][4], chg[2][4], lasttb[2][4]; uint32_t lastdyn[2]; void *lasttab[2];
+    uint64_t lastw[2][4], chg[2][(NVMTL_NBIND + 63) / 64], lasttb[2][4], texgen[2]; uint32_t lastdyn[2]; void *lasttab[2];
     uint32_t lastgl[2]; VkBuffer lastubuf[2]; VkDeviceSize lasturange[2];
 } nvmtl_bindtable;
 typedef struct nvmtl_address_page { nvk_buffer buffer; struct nvmtl_address_page *next; } nvmtl_address_page;
@@ -499,6 +499,98 @@ int main(void) {
     assert(nvmtl_snapshot_set_c(&c,1,&p)!=a && c.nsets==1); // cross-CB never searches prior history
     free(c.address_history); free(c.descriptor_history);
     puts("PASS: production FS A-B-A, colliding aggregate handles, mask growth, recycled sets, failed allocation and cross-CB isolation");
+    // Unread binding churn must not allocate a new set; later readers must still see the change.
+    for (dynamic=0; dynamic<=1; dynamic++) {
+        reuse_mode=0;
+        nvmtl_bindtable unused={0}; nvk_setref owned[64]={0};
+        c=(nvk_cmdbuf){.table=&unused,.sets=owned};
+        p=(nvk_pipeline){.gmask_ok=1}; p.gmask[1][0]=1ull<<NVMTL_NBUF;
+        VkDescriptorSet first=nvmtl_snapshot_set_c(&c,1,&p);
+        for(unsigned i=0;i<20;i++) {
+            unused.dirty[1]=1; unused.chg[1][0]|=1ull<<(NVMTL_NBUF+7);
+            assert(nvmtl_snapshot_set_c(&c,1,&p)==first && c.nsets==1);
+            assert(unused.dirty[1] && unused.chg[1][0]);
+        }
+        p.gmask[1][0]|=1ull<<(NVMTL_NBUF+7);
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=first && c.nsets==2);
+        // Used descriptors, storage writes, and recycled sets cannot take the shortcut.
+        unused.dirty[1]=1; unused.chg[1][0]=1ull<<NVMTL_NBUF;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=first && c.nsets==3);
+        first=unused.last[1]; unused.dirty[1]=1; unused.chg[1][0]=1ull<<(NVMTL_NBUF+9);
+        p.stex_hi[1]=1;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=first && c.nsets==4);
+        first=unused.last[1]; unused.dirty[1]=1; unused.chg[1][NVMTL_STEX_BASE>>6]=1ull<<(NVMTL_STEX_BASE&63);
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=first && c.nsets==5);
+        first=unused.last[1]; owned[unused.last_idx[1]].set=(void *)999;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=first && c.nsets==6);
+    }
+    // If lastw already covered a slot, ignoring its dirty evidence must not hide it when a later shader reads it.
+    {
+        reuse_mode=0; dynamic=1;
+        nvmtl_bindtable t={0}; nvk_setref refs[64]={0};
+        nvmtl_address_page ap={.buffer.buf=(void *)0x9000};
+        c=(nvk_cmdbuf){.table=&t,.sets=refs,.address_pages=&ap,.address_count=1};
+        p=(nvk_pipeline){.gmask_ok=1}; p.gmask[1][0]=(1ull<<NVMTL_NBUF)|(1ull<<(NVMTL_NBUF+7));
+        p.gmask[1][NVMTL_ADDRESS_BINDING>>6]|=1ull<<(NVMTL_ADDRESS_BINDING&63);
+        VkDescriptorSet original=nvmtl_snapshot_set_c(&c,1,&p);
+        p.gmask[1][0]&=~(1ull<<(NVMTL_NBUF+7));
+        t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);
+        uint32_t old_offset=c.dyn_out[1];
+        assert(nvmtl_snapshot_set_c(&c,1,&p)==original && c.nsets==1 && c.dyn_out[1]!=old_offset);
+        assert(t.dirty[1] && t.chg[1][0]);
+        p.gmask[1][0]|=1ull<<(NVMTL_NBUF+7);
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=original && c.nsets==2);
+        // A new page cannot use the prior page's descriptor. Non-dynamic tables also need a new descriptor.
+        p.gmask[1][0]&=~(1ull<<(NVMTL_NBUF+7));t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);
+        c.address_count=NVMTL_TABLES_PER_PAGE;
+        assert(nvmtl_snapshot_set_c(&c,1,&p) && c.nsets==3);
+        dynamic=0;t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);
+        assert(nvmtl_snapshot_set_c(&c,1,&p) && c.nsets==4);
+    }
+    {
+        nvmtl_bindtable t={0};nvk_setref refs[64]={0};nvmtl_address_page ap={.buffer.buf=(void *)0x8000};
+        c=(nvk_cmdbuf){.table=&t,.sets=refs,.address_pages=&ap,.address_count=1};
+        p=(nvk_pipeline){.gmask_ok=1};p.stex_hi[1]=NVMTL_NSTEX;
+        p.gmask[1][NVMTL_ADDRESS_BINDING>>6]=1ull<<(NVMTL_ADDRESS_BINDING&63);dynamic=1;
+        VkDescriptorSet before=nvmtl_snapshot_set_c(&c,1,&p);
+        t.dirty[1]=1;t.chg[1][(NVMTL_NBIND-1)>>6]=1ull<<((NVMTL_NBIND-1)&63);
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=before && c.nsets==2);
+        before=t.last[1];t.dirty[1]=1;t.chg[1][4]=1;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=before && c.nsets==3);
+    }
+    {
+        nvmtl_bindtable t={0};nvk_setref refs[64]={0};c=(nvk_cmdbuf){.table=&t,.sets=refs};
+        p=(nvk_pipeline){.gmask_ok=1};p.gmask[1][0]=1ull<<NVMTL_NBUF;
+        VkDescriptorSet plain=nvmtl_snapshot_set_c(&c,1,&p);
+        t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);
+        p.tbany=1;p.tbm[1][0]=1;
+        VkDescriptorSet typed=nvmtl_snapshot_set_c(&c,1,&p);assert(typed!=plain && c.nsets==2);
+        t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);p.tbany=0;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=typed && c.nsets==3);
+        p.gl_uniform_layout=1;p.gl_uniform_slot[1]=8;p.gl_uniform_range[1]=64;
+        t.s[1][7]=(nvmtl_slot){.kind=NVMTL_SLOT_BUF,.h=(void *)0x770000,.size=65536};
+        VkDescriptorSet u=nvmtl_snapshot_set_c(&c,1,&p);assert(c.nsets==4);
+        t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);p.gl_uniform_range[1]=128;
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=u && c.nsets==5);
+        t.dirty[1]=1;t.chg[1][0]=1ull<<(NVMTL_NBUF+7);c.nsets=0;
+        assert(nvmtl_snapshot_set_c(&c,1,&p) && c.nsets==1);
+    }
+    {
+        nvmtl_bindtable t={0};nvk_setref refs[64]={0};c=(nvk_cmdbuf){.table=&t,.sets=refs};
+        p=(nvk_pipeline){.gmask_ok=1};p.gmask[1][0]=1ull<<NVMTL_NBUF;
+        p.gmask[1][(NVMTL_NBUF+NVMTL_NTEX)>>6]|=1ull<<((NVMTL_NBUF+NVMTL_NTEX)&63);
+        assert(!nvmtl_bind_slot(&c,1,NVMTL_NBUF,NVMTL_SLOT_TEX,(void *)0x10000,0));
+        assert(!nvmtl_bind_slot(&c,1,NVMTL_NBUF+NVMTL_NTEX,NVMTL_SLOT_SAMP,(void *)0x20000,0));
+        VkDescriptorSet a=nvmtl_snapshot_set_c(&c,1,&p);
+        // Same shader, same masks, different actual image view, then a parked/embedded sampler replacement.
+        assert(!nvmtl_bind_slot(&c,1,NVMTL_NBUF,NVMTL_SLOT_TEX,(void *)0x30000,0));
+        VkDescriptorSet b=nvmtl_snapshot_set_c(&c,1,&p);assert(b!=a && c.nsets==2);
+        assert(!nvmtl_bind_slot(&c,1,NVMTL_NBUF+NVMTL_NTEX,NVMTL_SLOT_SAMP,(void *)0x40000,0));
+        VkDescriptorSet d=nvmtl_snapshot_set_c(&c,1,&p);assert(d!=b && c.nsets==3);
+        assert(!nvmtl_bind_slot(&c,1,NVMTL_NBUF,NVMTL_SLOT_TEX,(void *)0x10000,0));
+        assert(nvmtl_snapshot_set_c(&c,1,&p)!=d && c.nsets==4);
+    }
+    puts("PASS: inactive-binding reuse preserves dirty history, dynamic tables, rollover, high storage, view/sampler changes, layouts and ownership");
 }
 '''
 
@@ -848,15 +940,47 @@ int main(int argc, char **argv) { @autoreleasepool {
 } }
 '''
 
+# Compile the production table layout and slot writer: storage slots extend beyond the 256-bit shader-mask space.
+bind_types = section(vk, '#define NVMTL_EMB_KEYMAX', '\n// The model asks for the reads')
+bind_writer = section(vk, 'static int nvmtl_bind_slot(', '\nint nvmtl_vk_emb_same(')
+slot_fixture = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <vulkan/vulkan.h>
+#define nvlog(...) ((void)0)
+''' + macros + slots + bind_types + r'''
+typedef struct { void *table; } nvk_cmdbuf;
+static void nvmtl_hz_slot_bound(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t set, uint32_t binding, uint8_t kind, void *h) {}
+''' + bind_writer + '\n' + next(line for line in vk.splitlines() if line.startswith('#define NVMTL_COPY_HAS(')) + r'''
+int main(void) {
+    nvmtl_bindtable t={0}; nvk_cmdbuf c={.table=&t};
+    assert(sizeof(t.chg[0])*8 >= NVMTL_NBIND);
+    uint64_t copy_mask[4]={~0ull,~0ull,~0ull,~0ull};
+    assert(NVMTL_COPY_HAS(copy_mask,255) && !NVMTL_COPY_HAS(copy_mask,256) && !NVMTL_COPY_HAS(copy_mask,320));
+    for(unsigned set=0;set<2;set++) for(unsigned b=0;b<NVMTL_NBIND;b++) {
+        memset(&t,0,sizeof t); t.texgen[0]=0x100;t.texgen[1]=0x200;
+        assert(!nvmtl_bind_slot(&c,set,b,NVMTL_SLOT_TEX,(void *)0x10000,0));
+        assert(t.chg[set][b>>6] == (1ull<<(b&63)));
+        assert(t.texgen[0]==0x100+(set==0) && t.texgen[1]==0x200+(set==1));
+        assert(!t.emb_fn[0] && !t.emb_fn[1] && !t.emb_n[0] && !t.emb_n[1]);
+    }
+    puts("PASS: every production binding slot has an in-bounds change bit; no adjacent cache metadata corruption");
+}
+'''
 with tempfile.TemporaryDirectory() as d:
     path = pathlib.Path(d)
     includes = ['-I' + str(ROOT / 'plugin'), '-I' + str(pathlib.Path.home() / 'Vulkan-Headers/include')]
-    for name, code, objc in [('descriptors', fixture + mask + cache + checks, False), ('tables', table_fixture, False), ('resources', resources, True),
+    for name, code, objc in [('binding-bounds', slot_fixture, False), ('descriptors', fixture + mask + '\nstatic void nvmtl_hz_slot_bound(nvk_cmdbuf *c,nvmtl_bindtable *t,uint32_t s,uint32_t b,uint8_t k,void *h) {}\n' + bind_writer + cache + checks, False), ('tables', table_fixture, False), ('resources', resources, True),
                              ('defaults', state, False), ('bias', bias_check, False), ('formatting', formatting, True)]:
         src = path / (name + ('.m' if objc else '.c'))
         src.write_text(code)
         executable = path / name
         cmd = ['xcrun', 'clang', '-O2', '-Werror', *includes, str(src), '-o', str(executable)]
+        if name in ('binding-bounds', 'descriptors'):
+            cmd += ['-fsanitize=address,undefined', '-fno-sanitize-recover=all']
         if objc:
             cmd += ['-fobjc-arc', '-framework', 'Foundation']
         subprocess.run(cmd, check=True)

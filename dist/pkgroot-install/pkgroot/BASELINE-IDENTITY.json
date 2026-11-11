@@ -1,0 +1,350 @@
+{
+  "package_version": "2.8.1",
+  "previous_package_version": "2.8",
+  "previous_archive_sha256": "79251e8b685d98c39d7db7858ba161bba406a90847bccd46057aced4bb59b3dc",
+  "runtime_minimum_macos": "15.5",
+  "runtime_qualification": {
+    "os": "15.8.1",
+    "gpu": "RTX 5060",
+    "displays": 2,
+    "guarded_boot": "passed",
+    "refresh_change_commits": "60, 75 and 100 Hz committed on the changed display",
+    "known_issue": "after a refresh change on one display the other display can show blank frames until restart",
+    "metal_buffer_copy_bytes": 4096,
+    "metal_copy_verified": true
+  },
+  "paired_kexts": {
+    "NVRM": {
+      "sha256": "d56d2cbe75da03e7811967620014b41e6e7e72fdb24732196dd72f18f6004209"
+    },
+    "NVRMFB": {
+      "sha256": "a415c44950150d57a65676c7dc3ba0088017d2b2d7b7ff08748204a6abeed5b3"
+    },
+    "NVAccel": {
+      "sha256": "df7060a81ceddff8b109f3572baf074f2da7e1dbc2f708d58b03fc9055aa3507"
+    },
+    "NVRMAGDC": {
+      "sha256": "c90a08aff583708210df392be3ac21a1682126304b40b5afa43958077eb5619f"
+    }
+  },
+  "scope": "1.1.0 plus: the install leaves the Metal allow list readable by WindowServer (the CoreDisplay 'Failed to create MetalDevice' crash loop after install), and the kexts stay off while the boot-picker remove flag is set, so the way back survives a restart. This update installs only on macOS 15.",
+  "unqualified": [
+    "refresh changes with two displays connected (known issue, fix planned for 1.2)",
+    "macOS 26",
+    "RTX 5090 physical qualification",
+    "universal device and application support",
+    "DRM",
+    "automatic internal EFI migration",
+    "optional DTrace capture"
+  ],
+  "local_patched_build": {
+    "date": "2026-11-10",
+    "previous_local_archive_sha256": "35893fc28af50e1241e3859bd12052902e4914a67f627b576717498eb6be85d0",
+    "mesa_revision": "17ca6174",
+    "plugin_sha256": "480dfb209e36a2cc79cbe0bf648f196c10325ff865250650defa2d9e0d5ebc02",
+    "nvk_sha256": "27cb31945d6366b0585537a9ad61bf4db2b6ca93832e7b7374586a4717404342",
+    "nvk_minimum_macos": "15.5",
+    "runtime_qualification_scope": "local macOS26.7.2 only; minimum15.5 metadata does not qualify macOS15",
+    "binding_policy": {
+      "mode": "auto",
+      "qualified_raw_sha256": "ec60a89dcb54fb65e9edcdb2ca649b4db226170c7a0aa5d1991e8d89da9d0779",
+      "affected_slots": 2940,
+      "loaded_images_checked": 343,
+      "loader_cases": 12,
+      "allowed_diff": "single generated private binding opcode at18340120:3e->30 before signing",
+      "contract": "private hidden generated placeholders deliberately exclude host/dependency interposition, not generic weak-binding equivalence",
+      "unknown_auto_build": "preserve original bindings with warning"
+    },
+    "live_install_performed": true,
+    "snapshot_reuse_default": 0,
+    "changes": [
+      "Qualified exact-build fast NVK initialization restored with fail-closed AUTO checks",
+      "Lazy AIR aliases coalesce one decode attempt, including failure; independent blobs progress and later failures can retry",
+      "Asynchronous function specialization, descriptor and mesh pipeline APIs run on the existing bounded worker pool with input snapshots",
+      "Timing and browser/video probes verify actual pixels, mapped binaries and decoder evidence rather than capability flags",
+      "Descriptor changes cover all 321 slots (384 bits), not just 256; high storage bindings cannot corrupt neighboring cache state",
+      "Reuse immutable descriptors when only unread bindings changed, preserving dirty history, current address snapshots, ownership and layout checks"
+    ],
+    "codec_devnull_readonly": {
+      "tool": "tools/nvcodec_devnull_fix.py",
+      "dylibs": 9,
+      "reason": "Chrome GPU sandbox grants only file-read-data on /dev/null; O_RDWR token open failed in-process NVDEC/NVENC"
+    },
+    "upstream_prs_adopted": [
+      481,
+      530,
+      467
+    ],
+    "nvaccel_pageoff_unlocked_wait_default": 0,
+    "translator_cache_tag": "cs256 (code-signature SHA-256), file SHA-256 fallback",
+    "candidate_status": "Installed and locally tested; production sign-off NOT granted; see post_reboot_validation",
+    "historical_preinstall_validation": {
+      "gpu": "RTX 4060 Ti 8 GB",
+      "os": "26.7.2",
+      "python_scripts_passed": 88,
+      "real_icd_and_binding_cases": 17,
+      "async_specialization_callbacks": 16,
+      "async_specialization_gpu_values": 512,
+      "pipeline_stress": "36 sync,36 async,3 mixed concurrent rounds,16 async specialization requests; zero wrong",
+      "metal_probe": {
+        "runs_per_arm": 6,
+        "old_audited_device_ms": 371.177672,
+        "optimized_device_ms": 51.386755,
+        "installed_device_ms": 48.898467,
+        "old_audited_first_render_ms": 510.3921905,
+        "optimized_first_render_ms": 188.3093085,
+        "installed_async_caller_block_ms": 58.0481145,
+        "optimized_async_caller_block_ms": 0.722549,
+        "pixels_verified": true,
+        "scope": "fresh-process Metal probe; not whole-app launch or WindowServer speedup"
+      },
+      "chrome_installed": {
+        "webgl1_shader_texture_fbo_blend_resize_context_restore": "pass",
+        "webgl2": "pass",
+        "webgpu_compute": "pass",
+        "canvas_css_scroll": "pass",
+        "callback_p50_ms": 6.1,
+        "callback_p95_ms": 6.7,
+        "hardware_video": "unresolved: H264 FFmpeg CPU decoder; HEVC platform decoder is not hardware proof; raw device open failed under browser sandbox",
+        "candidate_mapping": "requested ICD override was not loaded, so no candidate-browser qualification claimed"
+      },
+      "native_video": {
+        "h264_hardware_frames": 90,
+        "hevc_hardware_frames": 90,
+        "all_pixels_match": true,
+        "scope": "explicit unsandboxed probe; eager registration opt-in is not enabled globally"
+      },
+      "window_server_new_build_verified": false,
+      "physical_no_flicker_or_tearing_certified": false
+    },
+    "candidate_validation": {
+      "gpu": "RTX 4060 Ti 8 GB",
+      "os": "26.7.2",
+      "address_and_undefined_sanitizers": "all binding slots, dirty history, changed views/samplers, cross-pipeline layouts, table rollover, storage bounds, retired sets",
+      "gpu_storage_readback": {
+        "metal_slots": [
+          62,
+          63,
+          127
+        ],
+        "pixels_verified": 96,
+        "pattern": "A-B-A with both output textures checked"
+      },
+      "surface_order_cases": 11,
+      "pipeline_stress": "3 rounds of 18 async +12 sync;16 async function callbacks/512 compute values;zero wrong",
+      "benchmark": {
+        "scope": "synthetic unread-slot churn; not real WindowServer qualification",
+        "pairs_per_workload": 6,
+        "draws_per_frame": 120,
+        "frames_per_run": 1600,
+        "churn_old_cpu_ms": 0.7909785,
+        "churn_candidate_cpu_ms": 0.654129,
+        "normal_old_cpu_ms": 0.791725,
+        "normal_candidate_cpu_ms": 0.788482,
+        "pixel_checked_processes": 24
+      },
+      "window_server_new_build_verified": false,
+      "physical_165fps_or_no_tearing_certified": false,
+      "python_scripts_passed": 92,
+      "python_scripts_failed": 0,
+      "source_sha256": {
+        "plugin/nvmtl_vk.c": "35a0606a8b1b2257c90293ff9641042c286081e96153c99c1f01ffd9fd877bf7",
+        "tools/test_opengl_perf.py": "ca69588829e8308c40ab9e1d81af01b24beb872288808be0044db1f9da8946a6",
+        "tools/bench_ca_draws.m": "bd505923d4fa54b94ca5da67f03a3aa16346adc6ee05e5b94d8f819f6304976c"
+      }
+    },
+    "installation_actor": "user",
+    "post_reboot_validation": {
+      "plugin_sha256": "480dfb209e36a2cc79cbe0bf648f196c10325ff865250650defa2d9e0d5ebc02",
+      "loaded_windowserver_uuid": "7301882A-EA42-3FAC-B3F5-669001684565",
+      "installed_bundle_matches_package": true,
+      "kext_binaries_match_package": true,
+      "signature_verified": true,
+      "metal_checks_passed": 16,
+      "metal_unavailable_source_skips": 1,
+      "storage_gpu_pixels_verified": 96,
+      "refresh_mode_hz": 164.875,
+      "compositor_windows": [
+        {
+          "source": "compositor.txt",
+          "cpu_percent_one_core": 174.6,
+          "cpu_ms_per_completed_output_update": 11.832,
+          "updates_per_s": 147.571,
+          "callbacks_per_s": 163.8,
+          "callback_p95_ms": 8.701,
+          "callback_max_ms": 47.516,
+          "flip_mean_us": 176.6527590847914,
+          "latch_timeout_steps": 1,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor.txt",
+          "cpu_percent_one_core": 160.33,
+          "cpu_ms_per_completed_output_update": 11.563,
+          "updates_per_s": 138.663,
+          "callbacks_per_s": 160.2,
+          "callback_p95_ms": 10.28,
+          "callback_max_ms": 43.208,
+          "flip_mean_us": 187.1304659498208,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor.txt",
+          "cpu_percent_one_core": 68.37,
+          "cpu_ms_per_completed_output_update": 4.569,
+          "updates_per_s": 149.632,
+          "callbacks_per_s": 164.6,
+          "callback_p95_ms": 7.904,
+          "callback_max_ms": 19.904,
+          "flip_mean_us": 180.87060384870603,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor.txt",
+          "cpu_percent_one_core": 68.83,
+          "cpu_ms_per_completed_output_update": 4.581,
+          "updates_per_s": 150.263,
+          "callbacks_per_s": 164.4,
+          "callback_p95_ms": 7.687,
+          "callback_max_ms": 18.927,
+          "flip_mean_us": 183.41611624834874,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor-after-stress.txt",
+          "cpu_percent_one_core": 92.23,
+          "cpu_ms_per_completed_output_update": 5.431,
+          "updates_per_s": 169.828,
+          "callbacks_per_s": 157,
+          "callback_p95_ms": 11.508,
+          "callback_max_ms": 51.53,
+          "flip_mean_us": 185.2960372960373,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor-after-stress.txt",
+          "cpu_percent_one_core": 85.02,
+          "cpu_ms_per_completed_output_update": 6.085,
+          "updates_per_s": 139.726,
+          "callbacks_per_s": 162.6,
+          "callback_p95_ms": 11.037,
+          "callback_max_ms": 31.898,
+          "flip_mean_us": 187.31985815602837,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor-final.txt",
+          "cpu_percent_one_core": 132.06,
+          "cpu_ms_per_completed_output_update": 9.638,
+          "updates_per_s": 137.009,
+          "callbacks_per_s": 152,
+          "callback_p95_ms": 12.427,
+          "callback_max_ms": 61.407,
+          "flip_mean_us": 186.32537960954446,
+          "latch_timeout_steps": 2,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        },
+        {
+          "source": "compositor-final.txt",
+          "cpu_percent_one_core": 105.03,
+          "cpu_ms_per_completed_output_update": 7.486,
+          "updates_per_s": 140.299,
+          "callbacks_per_s": 162.2,
+          "callback_p95_ms": 10.15,
+          "callback_max_ms": 43.184,
+          "flip_mean_us": 186.5593220338983,
+          "latch_timeout_steps": 0,
+          "late": 0,
+          "dropped": 0,
+          "failed": 0
+        }
+      ],
+      "crc_original": {
+        "duration_s": 20,
+        "reads": 602,
+        "observed_complete_grey_changes": 211,
+        "unknown_crc_changes": 0,
+        "physical_flicker_free_certified": false
+      },
+      "crc_intrusion_control": {
+        "debug.nvrmfb_flip_latch_timeouts": 111,
+        "debug.nvaccel_surface_gpu_timeouts": 0,
+        "debug.nvaccel_pageoff_pending_locked": 11,
+        "debug.nvaccel_iop_fail": 0,
+        "debug.nvaccel_iop_late": 0
+      },
+      "crc_fixed_probe": {
+        "exit": 2,
+        "result": "Aborted on one added flip timeout; inconclusive instead of false pass"
+      },
+      "surface_control_tests": [
+        {
+          "case": "abandoned",
+          "exit": 0,
+          "counter_deltas": {
+            "debug.nvrmfb_flip_latch_timeouts": 0,
+            "debug.nvaccel_surface_gpu_timeouts": 0,
+            "debug.nvaccel_pageoff_pending_locked": 0,
+            "debug.nvaccel_iop_fail": 0
+          }
+        },
+        {
+          "case": "cpu",
+          "exit": 0,
+          "counter_deltas": {
+            "debug.nvrmfb_flip_latch_timeouts": 0,
+            "debug.nvaccel_surface_gpu_timeouts": 0,
+            "debug.nvaccel_pageoff_pending_locked": 0,
+            "debug.nvaccel_iop_fail": 0
+          }
+        },
+        {
+          "case": "wait",
+          "exit": 0,
+          "counter_deltas": {
+            "debug.nvrmfb_flip_latch_timeouts": 0,
+            "debug.nvaccel_surface_gpu_timeouts": 0,
+            "debug.nvaccel_pageoff_pending_locked": 1,
+            "debug.nvaccel_iop_fail": 0
+          }
+        }
+      ],
+      "observed_crashes": 0,
+      "boot_cpu_resource_reports": 1,
+      "boot_cpu_resource_report_cause": "Shader translation/pipeline creation in macOS CPU-resource diagnostic; not a process crash",
+      "production_signoff": "Not granted: variable compositor costs, residual timeout observations, no long-session/physical-present certification",
+      "python_regressions": {
+        "total": 92,
+        "passed": 92,
+        "failures": []
+      },
+      "installed_benchmark": {
+        "pairs_per_workload": 4,
+        "targeted_old_cpu_ms": 0.724666,
+        "targeted_installed_cpu_ms": 0.6266375,
+        "normal_old_cpu_ms": 0.7072145,
+        "normal_installed_cpu_ms": 0.714101,
+        "scope": "synthetic CPU encoding; no desktop FPS claim"
+      }
+    }
+  }
+}

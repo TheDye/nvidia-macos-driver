@@ -11,6 +11,13 @@
 #include <stdatomic.h>
 enum { NG = 6, MAXV = 4096 };
 static unsigned crc(void) { int v = 0; size_t n = sizeof v; return sysctlbyname("debug.nvaccel_crc", &v, &n, NULL, 0) ? 0 : (unsigned)v; }
+// CRC collection can itself stall NVKMS. Stop rather than manufacture hundreds of display timeouts while claiming a clean test.
+static int64_t counter(const char *name) {
+    uint64_t v=0; size_t n=sizeof v;
+    if (sysctlbyname(name,&v,&n,NULL,0) || (n!=4 && n!=8) || v>INT64_MAX) return -1;
+    return (int64_t)v;
+}
+static int64_t counter_step(int64_t before, int64_t after) { return before<0 || after<before ? -1 : after-before; }
 static void pump(double s) { [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:s]]; }
 static unsigned vals[MAXV]; static unsigned long cnt[MAXV]; static int nv;
 static _Atomic int running;
@@ -18,6 +25,8 @@ static void note(unsigned v) { for (int i = 0; i < nv; i++) if (vals[i] == v) { 
 int main(int argc, char **argv) { @autoreleasepool {
     double secs = argc > 1 ? atof(argv[1]) : 5;
     if (!isfinite(secs) || secs < 1 || secs > 120) { fprintf(stderr, "seconds must be 1..120\n"); return 2; }
+    const int64_t timeoutsBefore=counter("debug.nvrmfb_flip_latch_timeouts");
+    const int64_t surfaceBefore=counter("debug.nvaccel_surface_gpu_timeouts");
     if (!crc()) { printf("debug.nvaccel_crc unavailable (0)\n"); return 2; }
     int head = 0; size_t hn = sizeof head; sysctlbyname("debug.nvaccel_crc_head", &head, &hn, NULL, 0);
     [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -36,7 +45,15 @@ int main(int argc, char **argv) { @autoreleasepool {
     for (int k = 0; k < NG; k++) {
         [CATransaction begin]; [CATransaction setDisableActions:YES]; v.layer.backgroundColor = g[k]; [CATransaction commit];
         pump(0.25);
-        nv = 0; for (int j = 0; j < 40; j++) { note(crc()); usleep(2000); }
+        nv = 0; for (int j = 0; j < 40; j++) {
+            note(crc()); usleep(2000);
+            int64_t dt=counter_step(timeoutsBefore,counter("debug.nvrmfb_flip_latch_timeouts"));
+            int64_t ds=counter_step(surfaceBefore,counter("debug.nvaccel_surface_gpu_timeouts"));
+            if (dt>0 || ds>0) {
+                printf("INCONCLUSIVE: timeout counters advanced during CRC probing (flip %lld, surface %lld); aborting intrusive measurement\n",(long long)dt,(long long)ds);
+                [w orderOut:nil]; return 2;
+            }
+        }
         int best = 0; for (int i = 1; i < nv; i++) if (cnt[i] > cnt[best]) best = i;
         learned[k] = vals[best];
         printf("grey %d: crc %08x (%lu of 40 reads agree)\n", k, learned[k], cnt[best]);
@@ -64,8 +81,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     printf("animated %.1f s: %lu frames committed (%.0f/s), %lu CRC reads, %lu frame changes observed: %lu complete greys, %lu unknown (%d distinct)\n",
            secs, shown, shown / secs, reads, known + unknown, known, unknown, distinctUnknown);
     printf("CRC sample rate %.1f/s; callbacks are not confirmed physical frames. Head-to-screen mapping must be checked.\n", reads / secs);
-    printf("%s\n", unknown ? "ANOMALY: unlearned CRCs observed; inspect tearing, overlays and cursor before attributing cause" :
+    int64_t timeoutDelta=counter_step(timeoutsBefore,counter("debug.nvrmfb_flip_latch_timeouts"));
+    int64_t surfaceDelta=counter_step(surfaceBefore,counter("debug.nvaccel_surface_gpu_timeouts"));
+    printf("During CRC probing: flip timeout delta %lld; surface timeout delta %lld (-1 = unavailable/reset)\n",(long long)timeoutDelta,(long long)surfaceDelta);
+    const int intrusive=timeoutDelta>0 || surfaceDelta>0;
+    printf("%s\n", intrusive ? "INCONCLUSIVE: timeout counters advanced during intrusive CRC collection; do not use this run as latency/smoothness qualification" : unknown ? "ANOMALY: unlearned CRCs observed; inspect tearing, overlays and cursor before attributing cause" :
            known < 2 ? "INCONCLUSIVE: too few CRC changes observed" : "NO ANOMALY OBSERVED in sampled CRCs; unsampled refreshes and panel-side flicker remain untested");
     [w orderOut:nil];
-    return unknown ? 1 : known < 2 ? 2 : 0;
+    return unknown ? 1 : intrusive || known < 2 ? 2 : 0;
 } }

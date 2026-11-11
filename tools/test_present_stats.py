@@ -239,3 +239,34 @@ fi
     r, changes, final = ab_run(['0', 'invalid'])
     assert r.returncode != 0 and not changes and '0 or 1' in r.stderr, (r, changes)
 print('A/B wrapper: default read-only, explicit interleave/restore, failed reporter restore, missing gate and invalid input pass')
+
+# A CRC measurement must not silently generate display timeouts and then print an unqualified clean result.
+crc_source = (root / 'tools/scanout_crc_tear_check.m').read_text()
+crc_helpers = crc_source[crc_source.index('static int64_t counter('):crc_source.index('static void pump(')]
+crc_test = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <stddef.h>
+static int fail, width=8; static uint64_t value=7;
+static int sysctlbyname(const char *n,void *out,size_t *len,void *in,size_t insize) {
+    if(fail)return -1;memcpy(out,&value,(size_t)width);*len=(size_t)width;return 0;
+}
+''' + crc_helpers + r'''
+int main(void) {
+    assert(counter("test")==7);width=4;assert(counter("test")==7);
+    width=2;assert(counter("test")==-1);width=8;value=UINT64_MAX;assert(counter("test")==-1);
+    value=7;fail=1;assert(counter("test")==-1);
+    assert(counter_step(3,3)==0 && counter_step(3,8)==5);
+    assert(counter_step(-1,8)==-1 && counter_step(8,2)==-1 && counter_step(8,-1)==-1);
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    path=pathlib.Path(directory);src=path/'crc-counters.c';exe=path/'crc-counters'
+    src.write_text(crc_test)
+    subprocess.run(['clang','-O1',str(src),'-o',str(exe)],check=True)
+    subprocess.run([str(exe)],check=True)
+assert 'if (dt>0 || ds>0)' in crc_source and 'aborting intrusive measurement' in crc_source
+assert 'intrusive || known < 2 ? 2 : 0' in crc_source
+print('CRC diagnostic: counter widths, unavailable/reset, intrusive-learning abort and inconclusive result pass')

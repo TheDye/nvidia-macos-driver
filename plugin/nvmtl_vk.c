@@ -2816,7 +2816,7 @@ static int nvmtl_dirty_only_on(void)
 typedef struct { void *mem; uint64_t lo, hi; uint8_t w, src, skip; } hz_ent;   // nvmtl_hazard.h: one access; mem NULL = any memory
 typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
-                 uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
+                 uint64_t chg[2][(NVMTL_NBIND + 63) / 64]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
                  uint32_t lastdyn[2]; void *lasttab[2];
                  uint64_t lasttb[2][4];   /* the texel-buffer mask the last set was written with */
@@ -4054,7 +4054,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
                                              VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *uniform);
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL); }
-#define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+#define NVMTL_COPY_HAS(m, i) ((m) && (i) < 256 && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *uniform)
 {
@@ -4316,8 +4316,12 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     // what changed is the table. On the same table page that is a new dynamic offset, not a new set.
     const int was = sametb && t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
                     && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
-    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull)
-        && !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3]) {
+    uint64_t nonbuffer = 0;
+    if (was) {
+        nonbuffer = t->chg[which][0] >> 32;
+        for (unsigned k = 1; k < sizeof t->chg[which] / sizeof t->chg[which][0]; k++) nonbuffer |= t->chg[which][k];
+    }
+    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull) && !nonbuffer) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
         const int table = NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING);
@@ -4329,6 +4333,30 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
                 && (void *)ai.buffer == t->lasttab[which]))) {
             if (table) t->lastdyn[which] = (uint32_t)ai.offset;
             t->dirty[which] = 0; memset(t->chg[which], 0, sizeof t->chg[which]);
+            c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
+            nvmtl_enc78_count(E78C_SETREUSE, 1);
+            return t->last[which];
+        }
+    }
+    // A shader does not observe slots outside its mask. Previously any such binding change dirtied the whole set and
+    // forced an allocation, even though all descriptors this draw reads remain immutable and correct. Leave dirty/chg
+    // intact: a later pipeline may read those changed slots, including slots covered by lastw but stale in this set.
+    // Address-table readers still snapshot all metadata (size/address can change without a chg bit). Dynamic-offset
+    // readers may keep the descriptor only while that new immutable table stays on the same owned buffer page.
+    if (was && hi <= t->last_hi[which]) {
+        int unchanged = 1;
+        for (int k = 0; k < 4; k++)
+            if ((pm[k] & ~t->lastw[which][k]) || (pm[k] & t->chg[which][k])) unchanged = 0;
+        for (uint32_t j = 0; j < hi && j < NVMTL_NSTEX; j++)
+            if (NVMTL_E78_HAS(t->chg[which], NVMTL_STEX_BASE + j)) unchanged = 0;
+        const int table = NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING);
+        const nvmtl_address_page *page = (const nvmtl_address_page *)c->address_pages;
+        const int samePage = !table || (nvmtl_table_ubo() && t->lasttab[which] && page &&
+            (c->address_count % NVMTL_TABLES_PER_PAGE) != 0 && (void *)page->buffer.buf == t->lasttab[which]);
+        VkDescriptorBufferInfo ai;
+        if (unchanged && samePage && (!table || (!nvmtl_address_snapshot(c, which, &ai) &&
+                (void *)ai.buffer == t->lasttab[which]))) {
+            if (table) t->lastdyn[which] = (uint32_t)ai.offset;
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
             nvmtl_enc78_count(E78C_SETREUSE, 1);
             return t->last[which];

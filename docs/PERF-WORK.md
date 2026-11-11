@@ -269,3 +269,67 @@ dealloc, and each alias image re-queried immutable format properties.
 - WindowServer 165 Hz workload after the sampler fixes: 3.86/3.94 ms CPU per output update, 71–72% of one core, p95 callback 9.7 ms; the remaining driver cost is spread (per-draw descriptor set write/allocate, sampler pipeline bind, embedded bindings), no single hot spot.
 - `bench_metal_load` sampled through a suspended-spawn launcher: device 48–57 ms (NVK device/channel creation 15 ms, plugin load 12 ms, IOSurface GPU policy 9 ms), library 60 ms of which 48 ms was the translator file SHA-256, pipeline 41 ms in descriptor setup of which 17 ms was the pool memset.
 - After: library 3–5 ms, first render 112–139 ms vs 179–196 ms (5/5 pairs), shader cache still hits across processes (second run of a new shader 312 → 5 ms).
+
+
+## Chrome A/V clocks and remaining acceleration limits — 2026-11-10
+
+Installed and packaged plugin: `29757a3d`; code signatures and all package checksums verified. No additional runtime driver change is retained from this investigation. The known-good H.264 decoder libraries (including the sandbox `O_RDONLY /dev/null` fix) were restored byte-for-byte after the detiling experiment below. The signed package archive is unchanged.
+
+### What was measured
+
+`tools/bench_chrome_av_sync.py` opens its own disposable visible Chrome 157 profile, plays an unmuted 1920×1080 60-fps H.264/HEVC video with 48 kHz AAC, then tests pause/resume, seek, and 1.25× playback. It reports `requestVideoFrameCallback` media time against the media element's clock projected to Chrome's expected display time. It does **not** measure speaker arrival, panel photons, or physical lip-sync. No forced sync offsets, sandbox relaxation, or persistent Chrome flags were applied.
+
+- H.264: active `nvd264_detile` / `nvd264_feed` stacks in Chrome's GPU process prove NVDEC activity. Steady 12 s window: 719 video callbacks, median software offset -5.65 ms, p05/p95 -11.43/-1.54 ms, one reported dropped frame out of 721. Pause/resume and seek: zero reported dropped frames, medians -1.98/-4.31 ms.
+- HEVC: active `nvd265_detile_rows` / `nvd265_feed` stacks prove NVDEC activity. Steady window: 719 callbacks, median software offset -10.21 ms, p05/p95 -17.21/-6.08 ms, one reported dropped frame out of 720. Pause/resume and seek: zero reported dropped frames, medians -7.32/-5.64 ms.
+- At 1.25×, both had zero reported dropped frames but 23 missed frame callbacks per 12 s. Callback gaps are **not** decoder drops or proof every physical refresh displayed a new frame.
+- rAF p50/p95 across those phases: 6.1/6.7 ms on the 164.875 Hz head. Separate short audio-confirmation runs reported 10,985 decoded audio bytes per codec, unmuted, no media errors, and zero drops in their 5 s measured windows.
+- GPU-process CPU during the longer runs: H.264 57.3% of one core, HEVC 29.8% (whole process, not decoder alone). Measurement windows skip the first 3 s. Earlier runs saw 8–20 drops during the first ~300 ms; startup is not drop-free.
+- Whole Python regression sweep: 92/92 passed, including the new 3-test offline probe suite and GL translation with the actual dylib. Resource-phi tests received their compiled dependency directory; historical negative controls received the local upstream history. Metal self-test: 16 passed, one missing-source skip.
+
+### Optimization investigated and rejected for shipping
+
+H.264's shipped untiler copies one byte at a time. Sampling found 681 of 1,367 non-wait leaf samples in `nvd264_detile`. An experimental 8/16-byte-run implementation matched 48 synthetic mode/size/index/field cases byte-for-byte; helper time was 5.4–5.6 → 0.34–0.43 ms per 1080p frame and Chrome GPU-process CPU approximately halved. **It is not in the installed driver or package:** overwriting machine code without requalifying its compact-unwind/DWARF metadata is unsafe even when pixels match. Both H.264 dylibs were restored from the verified package, keeping the earlier sandbox fix. Next implementation should rebuild the decoder from source (and its unwind metadata), not overwrite the function body.
+
+### PRs and highest-value next work
+
+- #481 and #530 are already applied. #467 remains default off: the local locked-pageoff counter stayed zero, so enabling it has no demonstrated benefit.
+- #487 adds VP9/AV1 through #477's large NVEncVT source import and fixes retained-frame ownership, but its author explicitly did **not** test Chrome. Do not equate Firefox's hardware support with Chrome integration. Existing hardware proof is H.264/HEVC only; VP9/AV1, DRM and WebRTC are not established by these tests.
+- #474 reader-skip, #475 shared multi-plane surfaces and #476 deferred uploads affect cross-process ownership; no new default is enabled without real capture/readback and contention tests.
+- Highest-value CPU target: source-built H.264 detiling/zero-copy output. Next GPU/compositor target: descriptor-set reuse with immutable per-draw state and bounded lifetime, benchmarked in real WindowServer (the existing experimental reuse flag stays off). Neither dropping correctness waits nor raising clocks blindly is a safe optimization.
+- 60-fps video cannot become 165 unique video frames/s merely by selecting a 165 Hz display. Non-integer display cadence is distinct from audio-clock drift. Physical flash/beep capture at the actual HDMI/DP/Bluetooth output is needed before compensating audio latency; network playback/adaptive switching, hour-long drift, HDR/DRM and WebRTC remain separate acceptance tests.
+
+Reproduce with a synchronized fixture:
+`python3 tools/bench_chrome_av_sync.py /path/to/av264.mp4 --transitions --out /tmp/av-report`
+The runner retains JSON, its exact HTML, the Chrome log and a GPU-process sample in the output directory. It does not touch the user's real Chrome profile or close their normal windows.
+
+
+## System-wide descriptor allocation and storage bounds candidate — 2026-11-10
+
+Scope: WindowServer/Metal CPU overhead and descriptor correctness, not browser optimization. Candidate plugin `480dfb20` is built and isolated-GPU-tested, **not installed**; installed baseline remains `29757a3d`.
+
+### Reproduced causes and patches
+
+- Source-extracted production `nvmtl_snapshot_set_c` test first failed: changing an unread texture slot allocated a new descriptor for every draw. Added conservative reuse only when the requested read mask and storage range are covered and unchanged, texel/uniform layouts match, the set still belongs to this recording, and any fresh immutable dynamic address table stays on the same retained page. Dirty/change evidence is deliberately retained for future readers. No GPU completion wait, barrier, retention or scheduling policy was removed.
+- A second failing production-layout test demonstrated **321 slots but only 256 change bits**. Expanded `chg` to six words, audited all readers, made the buffer-only fast path check upper words too, and bounded four-word copy masks to indices below 256. High storage descriptors are rewritten rather than copied through nonexistent mask bits.
+- ASan/UBSan fixtures cover every slot, no adjacent cache-state corruption, actual slot-writer invalidation on view/sampler replacement, mask narrowing/re-expansion with pending changes, texel/uniform layout changes, page rollover, retired/recycled sets and high storage writes. Candidate GPU checks at slots 62/63/127 verify A-B-A output in both textures (96 pixels); all 11 surface-order cases passed; pipeline stress produced zero wrong values.
+
+### Measurements and limits
+
+`BENCH_UNUSED_BINDINGS=1 tools/bench_ca_draws <plugin> 1600 120`: six interleaved old/candidate pairs, same process/device workload and default `NVMTL_SNAPSHOT_REUSE=0`. Median CPU/frame **0.7909785 → 0.654129 ms (-17.3%)**; wall/frame **0.6695595 → 0.5601815 ms (-16.3%)**. Normal alternating-used-texture workload: CPU 0.791725 → 0.788482 ms (no meaningful change). All 24 processes verified final pixels. This demonstrates the specific unread-binding case, **not** a real WindowServer speedup, higher physical FPS or reduced input-to-photon latency.
+
+Build is x86_64, minimum macOS 15.0, zero compiler errors and 330 existing warnings. Only macOS 26.7.2/RTX 4060 Ti was exercised. Kexts, NVK, video libraries and config stay unchanged. The 128-slot surface cache, ungated display wait and previous patches remain included. No new driver or bundle identity; existing package/patch archives are updated in place. Live desktop smoothness and no-flicker/tearing qualification require installation and reboot; do not claim a guaranteed 165 unique scanouts/s from callback rates.
+
+
+## Installed acceptance — 2026-11-10, RTX 4060 Ti / macOS 26.7.2
+
+The user's reboot loaded plugin `480dfb209e36a2cc79cbe0bf648f196c10325ff865250650defa2d9e0d5ebc02`. WindowServer's sampled image UUID `7301882A-EA42-3FAC-B3F5-669001684565` matches the on-disk binary; the full bundle and all five kext binaries match the package. Signature verified. Installed Metal suite: 16 passed, one source unavailable; storage slots62/63/127:96 pixels correct. Full Python suite:92 passed.
+
+Four paired old/installed runs (1,600 frames × 120 draws): targeted unused-slot churn CPU 0.724666 → 0.6266375 ms/frame (-13.5%), wall0.5998885 →0.51944 ms/frame; normal CPU0.7072145 →0.714101 and wall0.586538 →0.613278 (no demonstrated improvement). This qualifies the narrow optimization, not overall desktop speed.
+
+All eight 10 s compositor windows are retained in the local acceptance summary. CPU/update:11.832,11.563,4.569,4.581,5.431,6.085,9.638,7.486 ms. Callbacks152.0–164.6/s at164.875Hz, p95 7.687–12.427 ms, maximum interval61.407 ms. Zero reported late/drop/fail transactions, three latch timeout increments. No controlled same-workload old/new WindowServer comparison was performed, so no general compositor improvement is asserted.
+
+A boot CPU-resource diagnostic (87% of one core over103s; no action taken) attributes its heaviest stack to CoreAnimation pipeline creation and `nvmtl_translate_fc`. It is **not** a crash report. Costs vary with warm-up and background app activity.
+
+The CRC test is intrusive: a separate3s animation plus calibration produced111 extra latch timeouts and11 locked page-offs; immediately following ordinary workload windows hadzero latch timeout increments. The kernel CRC sysctl synchronously invokes NVKMS `getCRC32`. Fixed the existing collector to track counter deltas, abort calibration when a timeout advances, and return INCONCLUSIVE rather than a clean-looking pass. Live retest stopped on1 extra timeout with exit2. Counter helpers and abort policy are regression-tested. Initial20s sampling found211 complete-grey changes/602 reads and0 unknown, but those reads cannot certify physical tearing/flicker or every165Hz refresh. Across the broader CRC/GPU-stress interval, three surface-GPU timeouts were observed; later isolated abandoned/CPU/wait surface controls passed without additional surface or flip timeouts.
+
+**Release boundary:** installed and locally tested, not universally production-certified. Long-session stability, residual timeout causes and physical presentation remain unresolved. Keep fences, the default-off page-off experiment, and the existing rollback path; do not substitute capability flags or suppressed diagnostics for acceptance. The runtime payload is unchanged by this pass; only source diagnostics, tests, provenance/docs and archives are refreshed. No upstream PR/issue/comment or GitHub binary release is opened.
